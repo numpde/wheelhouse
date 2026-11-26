@@ -41,10 +41,15 @@ def validate_url(url, allow_test_http=False, previous=None):
 
 
 @contextmanager
-def network_policy(allow_test_http=False):
+def network_policy(allow_test_http=False, metadata_only=False):
+    def permitted(url, previous=None):
+        validate_url(url, allow_test_http, previous)
+        if metadata_only and unquote(urlsplit(url).path).lower().endswith(".whl"):
+            raise RuntimeError(f"Wheel-byte request forbidden during resolution: {url}")
+
     class HTTPSRequests(urllib.request.BaseHandler):
         def http_request(self, request):
-            validate_url(request.full_url, allow_test_http)
+            permitted(request.full_url)
             return request
 
         https_request = http_request
@@ -52,7 +57,7 @@ def network_policy(allow_test_http=False):
     class HTTPSRedirects(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, stream, code, message, headers, new_url):
             try:
-                validate_url(new_url, allow_test_http, previous=request.full_url)
+                permitted(new_url, previous=request.full_url)
             except ValueError as error:
                 # Keep the reason visible through the released SDK's error handling.
                 raise RuntimeError(str(error)) from error
@@ -287,19 +292,302 @@ def consume(action, lock, pool, local_output=None, allow_test_http=False):
     return {"artifacts": [artifact[0] for artifact in artifacts], "downloaded": downloaded}
 
 
+class Links(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.links.append(dict(attrs))
+
+
+def read_project(path, allow_test_http=False):
+    with path.open("rb") as stream:
+        data = tomllib.load(stream)
+    project = data.get("project", {})
+    if "dependencies" in project.get("dynamic", []):
+        raise ValueError("Dynamic dependencies require a build; supply static project.dependencies")
+    dependencies = project.get("dependencies")
+    if not isinstance(dependencies, list) or not all(isinstance(x, str) for x in dependencies):
+        raise ValueError("Expected a project.dependencies list of named PEP 508 requirements")
+    fields = set()
+    requirements = []
+    for text in dependencies:
+        requirement = Requirement(text)
+        if requirement.url is not None or "\n" in text or "\r" in text:
+            raise ValueError(f"Direct URLs and requirements-file directives are unsupported: {text}")
+        fields.update(marker_fields(requirement.marker))
+        requirements.append(str(requirement))
+    if project.get("requires-python") and not SpecifierSet(project["requires-python"]).contains(platform.python_version(), prereleases=True):
+        raise ValueError(f"This interpreter does not satisfy project.requires-python: {project['requires-python']}")
+    settings = data.get("tool", {}).get("wheelhouse", {})
+    if "index" not in settings:
+        raise ValueError("Declare tool.wheelhouse.index in the project file")
+    indexes = {"default": settings["index"]}
+    for name, source in settings.get("sources", {}).items():
+        normalized = canonicalize_name(name, validate=True)
+        if normalized in indexes:
+            raise ValueError(f"Duplicate or reserved package source: {name}")
+        indexes[normalized] = source
+    for source in indexes.values():
+        validate_url(source, allow_test_http)
+        if urlsplit(source).query or urlsplit(source).fragment:
+            raise ValueError(f"Index URLs must be plain base URLs: {source}")
+    return requirements, indexes, fields
+
+
+def lock_project(project, pool, output, allow_test_http=False):
+    """Give uv metadata and two views of each declared publisher; never wheel bytes."""
+    project, pool, output = map(Path, (project, pool, output))
+    requirements, indexes, marker_names = read_project(project, allow_test_http)
+    if output.suffix != ".lock":
+        raise ValueError("Use a .lock filename for the wheelhouse envelope, not pylock.toml")
+    if not pool.is_dir():
+        raise ValueError(f"Shared wheelhouse must already exist: {pool}")
+    if output.resolve().is_relative_to(pool.resolve()):
+        raise ValueError("Write the project lock outside the shared wheelhouse")
+    initial = {path.name for path in pool.iterdir()}
+    tags = set(sys_tags())
+    artifacts, observed, failures = {}, {}, []
+    gate = threading.RLock()
+
+    @lru_cache(maxsize=None)
+    def cached(name, checksum):
+        return name in initial and checksum is not None and sdk.inspect_artifact(pool, name, checksum)
+
+    @lru_cache(maxsize=None)
+    def page(package):
+        index = indexes.get(package, indexes["default"])
+        address = index.rstrip("/") + "/" + package + "/"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(address, headers={"Accept": "text/html"}), timeout=30) as response:
+                parser = Links()
+                parser.feed(response.read().decode("utf-8"))
+                base = response.geturl()
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                error.close()
+                return []
+            raise RuntimeError(f"Publisher index {address}: {error}") from error
+        except Exception as error:
+            raise RuntimeError(f"Publisher index {address}: {error}") from error
+        entries = []
+        for attrs in parser.links:
+            source = urljoin(base, attrs.get("href") or "")
+            parts = urlsplit(source)
+            filename = unquote(parts.path.rsplit("/", 1)[-1])
+            if not filename.endswith(".whl"):
+                continue
+            try:
+                name, version, _, wheel_tags = parse_wheel_filename(filename)
+            except InvalidWheelFilename:
+                continue
+            if "/" in filename or "\\" in filename or name != package:
+                raise ValueError(f"Wrong artifact identity from {address}: {filename}")
+            validate_url(source, allow_test_http)
+            values = parse_qs(parts.fragment).get("sha256", [])
+            checksum = values[0] if len(values) == 1 and re.fullmatch(r"[0-9a-f]{64}", values[0]) else None
+            url = parts._replace(fragment="").geturl()
+            token = hashlib.sha256(f"{url}\n{checksum}".encode()).hexdigest()
+            artifact = {"name": filename, "sha256": checksum, "url": url, "index": index,
+                        "package": name, "version": version, "tags": wheel_tags,
+                        "metadata": attrs.get("data-core-metadata", attrs.get("data-dist-info-metadata"))}
+            if token in artifacts and artifacts[token] != artifact:
+                raise ValueError(f"Conflicting index entries for {filename} at {index}")
+            artifacts[token] = artifact
+            entries.append((token, attrs))
+        return entries
+
+    @lru_cache(maxsize=None)
+    def metadata(token):
+        item = artifacts[token]
+        filename, checksum = item["name"], item["sha256"]
+        try:
+            if checksum is None:
+                raise ValueError("Publisher did not supply one valid artifact SHA-256")
+            if cached(filename, checksum):
+                data = wheel_metadata(pool / filename)
+            else:
+                hint = item["metadata"]
+                if not hint:
+                    raise ValueError("Required separate metadata is unavailable; wheel downloads are forbidden during resolution")
+                parts = urlsplit(item["url"])
+                address = parts._replace(path=parts.path + ".metadata").geturl()
+                with urllib.request.urlopen(address, timeout=30) as response:
+                    data = response.read()
+                if hint != "true":
+                    algorithm, expected = hint.split("=", 1)
+                    if hashlib.new(algorithm, data).hexdigest() != expected:
+                        raise ValueError(f"Publisher metadata hash mismatch: {address}")
+            marker_names.update(validate_metadata(data, filename))
+            return data
+        except Exception as error:
+            raise RuntimeError(f"Metadata for {filename} from {item['index']}: {error}") from error
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.serve(True)
+
+        def do_HEAD(self):
+            self.serve(False)
+
+        def serve(self, body):
+            try:
+                # Serialize access to the snapshot and evidence, not uv's solving.
+                with gate:
+                    data, content_type = self.route(body)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # uv can abandon an in-flight prefetch.
+            except Exception as error:
+                with gate:
+                    failures.append(error)
+                try:
+                    self.send_error(502, "Wheelhouse metadata request failed")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def route(self, body):
+            route = urlsplit(self.path).path.strip("/").split("/")
+            if len(route) == 2 and route[0] in ("cached", "all"):
+                kind, package = route
+                package = canonicalize_name(package, validate=True)
+                links = []
+                for token, attrs in page(package):
+                    item = artifacts[token]
+                    filename, checksum = item["name"], item["sha256"]
+                    if kind == "cached":
+                        if not item["tags"].intersection(tags):
+                            continue
+                        if attrs.get("data-requires-python") and not SpecifierSet(attrs["data-requires-python"]).contains(platform.python_version(), prereleases=True):
+                            continue
+                        try:
+                            if not cached(filename, checksum):
+                                continue
+                        except Exception as error:
+                            raise RuntimeError(f"Local wheel {filename} from {item['index']}: {error}") from error
+                    flags = ''.join(f' {name}="{html.escape(attrs[name] or "", quote=True)}"'
+                                    for name in ("data-requires-python", "data-yanked") if name in attrs)
+                    # Always force metadata requests, including explicit errors for missing sidecars.
+                    flags += ' data-core-metadata="true" data-dist-info-metadata="true"'
+                    fragment = f"#sha256={checksum}" if checksum else ""
+                    links.append(f'<a href="/wheel/{token}/{quote(filename)}{fragment}"{flags}>{html.escape(filename)}</a>')
+                return ("<!doctype html><html><body>" + "\n".join(links) + "</body></html>").encode(), "text/html"
+            if len(route) != 3 or route[0] != "wheel" or route[1] not in artifacts:
+                raise ValueError(f"Unexpected resolver request: {self.path}")
+            _, token, filename = route
+            item = artifacts[token]
+            if unquote(filename) != item["name"] + ".metadata":
+                raise RuntimeError(f"Wheel-byte request forbidden during resolution: {item['name']} from {item['index']}")
+            data = metadata(token)
+            if body:
+                identity = (item["index"], item["package"], item["version"])
+                observed.setdefault(identity, set()).add(hashlib.sha256(data).hexdigest())
+            return data, "application/octet-stream"
+
+    with tempfile.TemporaryDirectory(prefix="wheelhouse-resolve-") as temporary, network_policy(allow_test_http, metadata_only=True):
+        work = Path(temporary)
+        sanitized = work / "requirements.in"
+        sanitized.write_text("\n".join(requirements) + "\n")
+        raw = work / "pylock.toml"
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            server.daemon_threads = False
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            root = f"http://127.0.0.1:{server.server_port}"
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("UV_", "PIP_")) and key != "VIRTUAL_ENV"}
+            environment["NO_PROXY"] = environment["no_proxy"] = "127.0.0.1,::1"
+            try:
+                process = subprocess.run([
+                    "uv", "--no-config", "--no-cache", "pip", "compile", str(sanitized),
+                    "--python", sys.executable, "--no-python-downloads", "--only-binary=:all:",
+                    "--index", root + "/cached/", "--default-index", root + "/all/",
+                    "--index-strategy", "unsafe-first-match", "--allow-insecure-host", "127.0.0.1",
+                    "--no-header", "--quiet", "--output-file", str(raw),
+                ], cwd=work, env=environment, capture_output=True, text=True)
+            finally:
+                server.shutdown()
+                thread.join()
+        if failures:
+            raise RuntimeError(str(failures[0])) from failures[0]
+        if process.returncode:
+            raise RuntimeError(f"uv could not resolve dependencies:\n{process.stderr.strip()}")
+        resolution = tomllib.loads(raw.read_text())
+        evidence = {}
+        for package in resolution.get("packages", []):
+            name = canonicalize_name(package["name"])
+            index = indexes.get(name, indexes["default"])
+            identity = (index, name, Version(package["version"]))
+            digests = observed.get(identity, set())
+            if len(digests) != 1:
+                raise ValueError(f"Expected one consistent resolver metadata digest for {name} {package['version']} from {index}; got {sorted(digests)}")
+            expected = next(iter(digests))
+            package["index"] = index
+            if not package.get("wheels") or any(key in package for key in ("sdist", "archive", "vcs", "directory")):
+                raise ValueError(f"Expected registry wheels only for {name}")
+            for wheel in package["wheels"]:
+                alias = urlsplit(wheel["url"])
+                parts = alias.path.strip("/").split("/")
+                if f"{alias.scheme}://{alias.netloc}" != root or len(parts) != 3 or parts[0] != "wheel":
+                    raise ValueError(f"Unexpected artifact URL from uv for {name}")
+                item = artifacts[parts[1]]
+                if unquote(parts[2]) != item["name"] or (item["index"], item["package"], item["version"]) != identity:
+                    raise ValueError(f"Artifact identity changed during resolution for {name}")
+                checksum = item["sha256"]
+                if wheel["hashes"].get("sha256") != checksum or checksum is None:
+                    raise ValueError(f"uv artifact hash disagrees with publisher for {item['name']}")
+                wheel["url"] = item["url"]
+                wheel["name"] = item["name"]
+                # Upload timestamps are optional provenance, not artifact identity;
+                # omit TOML datetime objects from the JSON envelope.
+                wheel.pop("upload-time", None)
+                if checksum in evidence and evidence[checksum] != expected:
+                    raise ValueError(f"One wheel was assigned inconsistent metadata: {item['name']}")
+                # uv may use one wheel's metadata for a version. Every retained wheel
+                # must match those exact bytes before acquisition or offline use.
+                evidence[checksum] = expected
+        envelope = {"wheelhouse-lock": 1, "target": target_environment(marker_names),
+                    "resolution": resolution, "metadata": evidence}
+        encoded = (json.dumps(envelope, indent=2, sort_keys=True) + "\n").encode()
+        if root.encode() in encoded:
+            raise ValueError("Temporary resolver URLs remain in the lock")
+        staged = work / "wheelhouse.lock"
+        staged.write_bytes(encoded)
+        load_locked(staged, allow_test_http)  # Check the exact consumer contract before replacing the lock.
+        atomic_write(output, encoded)
+    return {"lock": str(output), "packages": len(resolution.get("packages", [])), "wheel-downloads": 0}
+
+
 def main(argv=None, *, allow_test_http=False):
     parser = argparse.ArgumentParser(description=__doc__)
     subcommands = parser.add_subparsers(dest="action", required=True)
-    for action in ("acquire", "check"):
+    for action in ("lock", "acquire", "check"):
         command = subcommands.add_parser(action)
         command.add_argument("--lock", type=Path, required=True)
         command.add_argument("--pool", type=Path, required=True)
-        command.add_argument("--local-lock", type=Path)
+        if action == "lock":
+            command.add_argument("--project", type=Path, required=True)
+        else:
+            command.add_argument("--local-lock", type=Path)
     arguments = parser.parse_args(argv)
     try:
-        result = consume(arguments.action, arguments.lock, arguments.pool,
-                         arguments.local_lock, allow_test_http=allow_test_http)
-    except (OSError, ValueError, RuntimeError) as error:
+        if arguments.action == "lock":
+            result = lock_project(arguments.project, arguments.pool, arguments.lock,
+                                  allow_test_http=allow_test_http)
+        else:
+            result = consume(arguments.action, arguments.lock, arguments.pool,
+                             arguments.local_lock, allow_test_http=allow_test_http)
+    except Exception as error:
         print(f"wheelhouse: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
