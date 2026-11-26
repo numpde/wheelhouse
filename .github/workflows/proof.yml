@@ -3,7 +3,7 @@ name: Wheelhouse proof
 on:
   push:
     branches: [main]
-    paths: [wheelhouse.py, Dockerfile, Makefile, proof.toml, .github/workflows/proof.yml]
+    paths: [wheelhouse.py, Dockerfile, Makefile, "tests/**", .github/workflows/proof.yml]
   workflow_dispatch:
 
 permissions:
@@ -16,4 +16,4 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Run the same container proof as an operator
-        run: make proof ENGINE_CONTEXT=default
+        run: make test ENGINE_CONTEXT=default

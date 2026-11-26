@@ -16,25 +16,26 @@ metadata from verified local wheels or the publisher's exact wheel sidecar.
 Missing required metadata is an error, including when encountered by uv's
 prefetching. Existing locks survive failed resolution.
 
-## Run the proof
+## Run the integration test
 
 Choose an existing Docker context explicitly. For example:
 
 ```sh
 cd /home/ra/repos/wheelhouse &&
-make proof ENGINE_CONTEXT=science
+make test ENGINE_CONTEXT=science
 ```
 
-The [Makefile](Makefile) runs four targets in order: `image`, `lock`, `acquire`,
-`offline`. Dependencies and publisher are declared in [proof.toml](proof.toml).
-All Python and packaging tools run in the prepared `wheelhouse:proof` image.
+The checked-in [unittest](tests/test_wheelhouse.py) uses a static
+[project fixture](tests/fixtures/pyproject.toml). Its online phase resolves,
+acquires and checks reuse. A fresh container then verifies and installs the
+same artifacts with networking disabled and its inputs mounted read-only.
 
-The host keeps `.proof/project/wheelhouse.lock` and `.proof/wheels/` between
-runs. Lock creation mounts the wheels read-only. The fresh offline container
-mounts both inputs read-only and disables networking: it repeats acquisition
-to demonstrate reuse, verifies the wheels, installs them, and checks the
-installed dependencies. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
-runs the same Make target.
+The [Makefile](Makefile) prepares `wheelhouse:proof` and runs both phases.
+Generated locks and wheels live in a temporary Docker volume mounted at
+`/trial`; Make removes it on success or failure. Temporary installation files
+are cleaned by the test and both containers are removed automatically.
+All Python runs inside Docker. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
+runs the same target; `make proof` remains an alias.
 
 ## Use an existing shared wheel folder
 
@@ -130,7 +131,8 @@ marker values are recorded only when consulted by dependency markers. Other
 machines must match that target and have compatible wheel tags; this is not
 a cross-platform resolution. No persistent resolver cache is required.
 
-The proof covers Requests/NumPy acquisition, reuse and offline installation.
-Resolver edge cases, failure scenarios, real Torch/CUDA acquisition and the
-operator's existing wheel folder remain separate trials. Publishers without
-the required sidecars need the exact wheel to be already present in the pool.
+The test covers Requests/NumPy acquisition, reuse, offline installation, and
+rejection of missing wheels or invalid metadata evidence. Resolver edge cases,
+real Torch/CUDA acquisition and the operator's existing wheel folder remain
+separate trials. Publishers without the required sidecars need the exact wheel
+to be already present in the pool.
