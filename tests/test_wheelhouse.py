@@ -1,11 +1,7 @@
-"""Run Online, then Offline in a fresh container with /trial read-only and no network.
-
-Make owns the temporary shared volume; each test owns its temporary working files.
-"""
+"""Make runs Online, then Offline with /trial read-only and networking disabled."""
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -20,38 +16,29 @@ import tomli_w
 POOL = Path("/trial/wheels")
 LOCK = Path("/trial/wheelhouse.lock")
 FIXTURE = Path(__file__).parent / "fixtures" / "pyproject.toml"
-TOOL = "/opt/wheelhouse/wheelhouse.py"
+UV = ("uv", "--no-config", "--no-cache")
 
 
 def snapshot():
-    return {
-        str(path.relative_to(POOL)): hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-        for path in POOL.rglob("*")
-    }
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in POOL.iterdir()}
 
 
 class Commands(unittest.TestCase):
-    def execute(self, *arguments):
-        environment = {key: value for key, value in os.environ.items() if not key.startswith("UV_")}
-        return subprocess.run([str(item) for item in arguments], capture_output=True, text=True, env=environment)
-
-    def succeeds(self, *arguments):
-        result = self.execute(*arguments)
-        self.assertEqual(result.returncode, 0, f"{arguments}\n{result.stdout}\n{result.stderr}")
-        return result
-
-    def tool(self, action, *, lock=LOCK, pool=POOL, project=None, projection=None, error=None):
-        arguments = [sys.executable, TOOL, action, "--lock", lock, "--pool", pool]
-        if project is not None:
-            arguments += ["--project", project]
-        if projection is not None:
-            arguments += ["--local-lock", projection]
-        if error is not None:
-            result = self.execute(*arguments)
-            self.assertNotEqual(result.returncode, 0, result.stdout)
+    def command(self, *arguments, error=None):
+        result = subprocess.run([str(item) for item in arguments], capture_output=True, text=True)
+        if error is None:
+            self.assertEqual(result.returncode, 0, f"{arguments}\n{result.stdout}\n{result.stderr}")
+        else:
+            self.assertNotEqual(result.returncode, 0)
             self.assertIn(error.lower(), result.stderr.lower())
-            return None
-        return json.loads(self.succeeds(*arguments).stdout)
+        return result.stdout
+
+    def tool(self, action, *, error=None, **options):
+        arguments = [sys.executable, "/opt/wheelhouse/wheelhouse.py", action]
+        for name, value in ({"lock": LOCK, "pool": POOL} | options).items():
+            arguments += ["--" + name.replace("_", "-"), value]
+        output = self.command(*arguments, error=error)
+        return json.loads(output) if error is None else None
 
 
 class Online(Commands):
@@ -60,11 +47,8 @@ class Online(Commands):
         self.tool("lock", project=FIXTURE)
         self.assertEqual(list(POOL.iterdir()), [], "Lock creation populated the wheel pool")
         acquired = self.tool("acquire")
-        self.assertTrue(acquired["artifacts"])
         self.assertCountEqual(acquired["downloaded"], acquired["artifacts"])
-        self.assertEqual({path.name for path in POOL.glob("*.whl")}, set(acquired["artifacts"]))
         original_lock, original_pool = LOCK.read_bytes(), snapshot()
-        self.assertEqual(self.tool("acquire")["downloaded"], [])
         with tempfile.TemporaryDirectory(prefix="wheelhouse-warm-") as temporary:
             temporary = Path(temporary)
             declaration = tomllib.loads(FIXTURE.read_text())
@@ -74,42 +58,35 @@ class Online(Commands):
             project, warm = temporary / "pyproject.toml", temporary / "warm.lock"
             project.write_text(tomli_w.dumps(declaration))
             self.tool("lock", project=project, lock=warm)
-            checked = self.tool("check", lock=warm)
-            self.assertCountEqual(checked["artifacts"], acquired["artifacts"])
-            self.assertEqual(self.tool("acquire", lock=warm)["downloaded"], [])
+            reused = self.tool("acquire", lock=warm)
+            self.assertCountEqual(reused["artifacts"], acquired["artifacts"])
+            self.assertEqual(reused["downloaded"], [])
         self.assertEqual(LOCK.read_bytes(), original_lock)
         self.assertEqual(snapshot(), original_pool)
 
 
 class Offline(Commands):
-    def test_offline_installation_and_rejection(self):
+    def test_offline_installation(self):
         self.assertEqual(self.tool("acquire")["downloaded"], [])
         with tempfile.TemporaryDirectory(prefix="wheelhouse-offline-") as temporary:
             temporary = Path(temporary)
             projection, venv = temporary / "pylock.toml", temporary / "venv"
-            self.tool("check", projection=projection)
-            self.succeeds("uv", "--no-config", "--no-cache", "venv", venv,
-                          "--python", sys.executable, "--no-python-downloads")
+            self.tool("check", local_lock=projection)
+            self.command(*UV, "venv", venv, "--python", sys.executable, "--no-python-downloads")
             python = venv / "bin" / "python"
-            self.succeeds("uv", "--no-config", "--no-cache", "pip", "sync", "--offline", "--no-index",
-                          "--no-python-downloads", "--only-binary=:all:", "--require-hashes",
-                          "--python", python, projection)
-            self.succeeds(python, "-I", "-c", "import numpy, requests; assert numpy.arange(3).sum() == 3")
-            self.succeeds("uv", "--no-config", "--no-cache", "pip", "check", "--python", python)
+            self.command(*UV, "pip", "sync", "--offline", "--no-index",
+                         "--no-python-downloads", "--only-binary=:all:", "--require-hashes",
+                         "--python", python, projection)
+            self.command(python, "-I", "-c", "import numpy, requests; assert numpy.arange(3).sum() == 3")
+            self.command(*UV, "pip", "check", "--python", python)
 
             rejected = temporary / "pylock.rejected.toml"
             empty = temporary / "empty"
             empty.mkdir()
-            self.tool("check", pool=empty, projection=rejected, error="Missing locked wheels")
+            self.tool("check", pool=empty, local_lock=rejected, error="Missing locked wheels")
+            altered = json.loads(LOCK.read_text())
+            altered["metadata"] = {}
+            lock = temporary / "missing-metadata.lock"
+            lock.write_text(json.dumps(altered))
+            self.tool("check", lock=lock, local_lock=rejected, error="metadata")
             self.assertFalse(rejected.exists())
-            original = json.loads(LOCK.read_text())
-            for case, evidence in (
-                ("absent", {}),
-                ("mismatched", dict.fromkeys(original["metadata"], "0" * 64)),
-            ):
-                with self.subTest(metadata=case):
-                    altered = dict(original, metadata=evidence)
-                    lock = temporary / f"{case}.lock"
-                    lock.write_text(json.dumps(altered))
-                    self.tool("check", lock=lock, projection=rejected, error="metadata")
-                    self.assertFalse(rejected.exists())

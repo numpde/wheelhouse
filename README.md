@@ -1,50 +1,41 @@
 # Wheelhouse
 
-A small standalone implementation of [the desiderata](notes/000_desiderata.txt).
-uv resolves dependencies and installs packages; `packaging` validates locks and
-selects compatible wheels. This repo implements the local preference, shared
-pool, acquisition and mandatory metadata checks. Its two Python dependencies
-(`packaging` and the TOML writer `tomli-w`) are hash-pinned in
-[requirements.txt](requirements.txt) and installed inside the tools image.
+Prefer wheels already in a shared folder, resolve missing dependencies from
+metadata, then acquire and install the locked files. See the
+[desiderata](notes/000_desiderata.txt).
 
-| Operation | Project | Shared wheel folder | Network |
+uv handles resolution and installation; `packaging` handles lock validation and
+wheel selection. This repo supplies pool management and metadata checks.
+Its Python dependencies are pinned in [requirements.txt](requirements.txt)
+and installed inside the tools image.
+
+| Command | Project | Shared wheel folder | Network |
 | --- | --- | --- | --- |
-| `lock` | Read declarations; atomically write `wheelhouse.lock` | Read-only | Publisher indexes and separate metadata only |
-| `acquire` | Read the existing lock | Reuse verified files; publish missing verified wheels | Locked artifact URLs |
-| `check` | Read the existing lock; optionally write a disposable local pylock | Read-only | None needed |
+| `lock` | Read declarations; write `wheelhouse.lock` | Read-only | Publisher indexes and separate metadata |
+| `acquire` | Read the lock | Reuse verified files; download missing wheels | Locked artifact URLs |
+| `check` | Read the lock; optionally write a local pylock | Read-only | None |
 
-Lock creation never fetches remote wheel contents or byte ranges. It reads
-metadata from verified local wheels or the publisher's exact wheel sidecar.
-Missing required metadata is an error, including when encountered by uv's
-prefetching. Existing locks survive failed resolution.
+## Test
 
-## Run the integration test
-
-Choose an existing Docker context explicitly. For example:
+Choose an existing Docker context explicitly:
 
 ```sh
 cd /home/ra/repos/wheelhouse &&
 make test ENGINE_CONTEXT=science
 ```
 
-The [artifact tests](tests/test_artifacts.py) run without networking and check
-verified publication, reuse, and rejection of corrupted files and metadata.
-The [integration test](tests/test_wheelhouse.py) uses a static
-[project fixture](tests/fixtures/pyproject.toml). Its online phase resolves,
-acquires and checks reuse. A fresh container then verifies and installs the
-same artifacts with networking disabled and its inputs mounted read-only.
+Make builds the tools image and runs the [artifact tests](tests/test_artifacts.py)
+and the [Requests/NumPy integration test](tests/test_wheelhouse.py), using the
+[checked-in project](tests/fixtures/pyproject.toml). The integration test acquires
+wheels online, then installs them in a fresh container with networking disabled
+and inputs mounted read-only. Its temporary Docker volume is mounted at `/trial`
+and removed on success or failure; test containers and scratch files are also
+removed. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
+runs the same target. No host Python is needed.
 
-The [Makefile](Makefile) prepares `wheelhouse:proof` and runs the tests.
-Generated locks and wheels live in a temporary Docker volume mounted at
-`/trial`; Make removes it on success or failure. Temporary installation files
-are cleaned by the tests and all test containers are removed automatically.
-All Python runs inside Docker. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
-runs the same target; `make proof` remains an alias.
+## Use a shared wheel folder
 
-## Use an existing shared wheel folder
-
-In the consuming project's `pyproject.toml`, declare static dependencies and
-their publishers once. For example:
+Declare dependencies and publishers in the consuming project's `pyproject.toml`:
 
 ```toml
 [project]
@@ -53,14 +44,13 @@ dependencies = ["requests>=2.32,<3"]
 [tool.wheelhouse]
 index = "https://pypi.org/simple"
 
-# Optional package-specific publisher, used for all candidates of that package:
+# Optional publisher for a particular package:
 # [tool.wheelhouse.sources]
 # torch = "https://download.pytorch.org/whl/cpu"
 ```
 
-Set `project` and `pool` below to existing absolute paths. The interpreter and
-platform of the tools container define the target; use the same prepared tools
-image for these operations and the offline consumer.
+Set `project` and `pool` to existing absolute paths. The tools image defines the
+Python version and platform for the lock and its consumers.
 
 ```sh
 context=science &&
@@ -79,17 +69,15 @@ docker --context "$context" run --rm --pull never \
   "$image" acquire --lock /project/wheelhouse.lock --pool /wheels
 ```
 
-Commit `wheelhouse.lock`. Downloads go into the existing host folder mounted
-at `/wheels`. Missing files are staged privately on that filesystem, checked
-against both hashes, then published atomically. Conflicting existing files
-are retained and reported. A complete pool also permits `acquire` with a
-read-only mount. Acquisition never resolves again or updates the lock.
+Commit `wheelhouse.lock`. Downloads go into the host folder mounted at `/wheels`.
+Each wheel must match both its artifact hash and the metadata used during
+resolution before publication or reuse. Conflicting pool files are retained
+and reported. Acquisition follows the lock without resolving again.
 
-## Offline consumer
+## Install offline
 
-An offline container or Docker build must mount the project and wheel folder
-read-only, disable networking, and use already prepared images. Inside that
-container, run:
+Use the prepared tools image with networking disabled and the project and wheel
+folder mounted read-only at `/project` and `/wheels`. Inside the container:
 
 ```sh
 python /opt/wheelhouse/wheelhouse.py check \
@@ -102,41 +90,21 @@ uv --no-config --no-cache pip sync --offline --no-index \
   --python /opt/venv/bin/python /tmp/pylock.toml
 ```
 
-`check` verifies every selected wheel before producing `/tmp/pylock.toml`.
-That disposable file contains local paths for the installer; the committed
-lock remains authoritative. In an application build, retain `/opt/venv` and
-the application code in the resulting image. The runtime application needs
-the installed environment; the wheel folder is only a build input.
+`/tmp/pylock.toml` is a disposable projection containing local paths. Keep
+`/opt/venv` and the application in the resulting image; the wheel folder is a
+build input.
 
-## Lock contract and scope
+## Lock and scope
 
-`wheelhouse.lock` is a versioned JSON envelope containing a standard pylock
-resolution, the target environment, and a required mapping from each wheel's
-SHA-256 to the SHA-256 of the exact metadata used during resolution. Required
-evidence is part of this format, rather than optional pylock tool annotations.
-Consumption rejects absent evidence before selecting or downloading artifacts.
+The committed lock contains the target, a standard pylock resolution, and the
+expected SHA-256 of each wheel's complete embedded `METADATA`. This evidence is
+required for every permitted wheel. The lock is portable to machines matching
+its Python version, ABI, OS and architecture; other targets need their own lock.
 
-uv can resolve a version using one representative wheel's metadata. Every
-wheel retained for that version is therefore bound to the same metadata
-expectation. Acquisition and offline checking compare its complete embedded
-`METADATA` bytes against that expectation. Hashing covers all headers; semantic
-validation covers identity and dependency fields, including malformed or
-duplicated dependency fields. Unrelated historical licence headers do not
-prevent resolution.
-
-The current scope is static named dependencies, wheels, and declared HTTPS
-Simple API publishers. Direct dependency URLs, source builds, and dynamic
-project dependencies fail explicitly. Artifact hashes must come from the
-publisher. Publisher redirects are checked; lock-time redirects to wheel
-URLs are blocked. HTTP is available only through an internal proof hook.
-
-The lock records the running interpreter, ABI, OS and architecture. Kernel
-marker values are recorded only when consulted by dependency markers. Other
-machines must match that target and have compatible wheel tags; this is not
-a cross-platform resolution. No persistent resolver cache is required.
-
-The test covers Requests/NumPy acquisition, reuse, offline installation, and
-rejection of missing wheels or invalid metadata evidence. Resolver edge cases,
-real Torch/CUDA acquisition and the operator's existing wheel folder remain
-separate trials. Publishers without the required sidecars need the exact wheel
-to be already present in the pool.
+The prototype accepts static named dependencies and wheels from HTTPS Simple
+API publishers. Resolution needs separately published metadata or a verified
+local wheel; it never downloads wheel contents or byte ranges. Missing metadata
+causes a failure and preserves the existing lock. Source builds, dynamic
+dependencies and direct dependency URLs are outside the current scope.
+Requests/NumPy is exercised by the integration test; Torch/CUDA remains a
+separate trial.
