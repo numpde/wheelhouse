@@ -1,0 +1,97 @@
+Wheelhouse desiderata
+=====================
+
+Goal: reuse what is already available, acquire only what is missing, and
+build reproducibly offline, with minimal custom code.
+
+1. Local-first resolution
+   When creating a lock, prefer eligible wheels in the existing shared
+   wheelhouse. If they suffice, do not download their contents again,
+   even in a new repository with an empty tool cache. Requests for
+   publisher metadata are permissible and distinct from wheel downloads.
+
+2. Target compatibility
+   Respect dependency constraints, package versions, Python versions,
+   ABI, operating system, architecture, and the requested CPU/CUDA
+   variant. Local availability must not override compatibility or
+   declared package sources.
+
+3. Acquisition of missing artifacts
+   When local wheels are insufficient, acquire the missing required
+   artifacts from their declared sources. Online fallback must continue
+   to reuse eligible cached wheels rather than replacing them with
+   newer remote versions solely because other dependencies are missing.
+   Verify artifact hashes and publish complete files atomically.
+
+4. One authoritative, portable lock
+   Record the resolved dependencies and their selected artifact
+   identities, including hashes and genuine acquisition URLs. The lock
+   must be sufficient to acquire the same artifacts on another machine.
+   Do not embed host-specific paths or maintain competing dependency
+   records. Do not infer publisher URLs from wheel filenames.
+
+5. Offline builds
+   Build and install from the committed lock and local artifacts only.
+   Do not resolve dependencies again, update the lock, download
+   artifacts, or pull images implicitly. Missing or incorrect files
+   must cause a clear failure. Lock updates and acquisition are
+   explicit operations.
+
+6. Shared wheelhouse
+   Reuse a single host-local wheelhouse across repositories and targets.
+   Multiple Python versions, ABIs, platforms, and CPU/CUDA variants
+   may coexist. A fresh repository or a change of tooling must not
+   require downloading existing eligible wheels into another cache.
+
+7. Existing packaging machinery
+   Delegate dependency resolution, version comparison, compatibility,
+   and installation to established tools. Keep custom code to minimal
+   orchestration. Each decision should have one owner; avoid
+   duplicating resolver or artifact-selection logic.
+
+8. Contained execution
+   Run dependency tooling and installation inside containers with pinned
+   tools and an explicitly selected Docker context. Do not require
+   host Python or host package installations. Declare each version,
+   source, and target setting once.
+
+9. Small operator workflow
+   A new repository should require little more than dependency
+   declarations and ordinary tool invocations. Minimize files,
+   commands, custom code, and configuration duplication, subject to
+   satisfying the behavioral requirements above.
+
+
+Resolution versus lock consumption
+---------------------------------
+
+When creating a lock, prefer eligible locally available artifacts.
+
+When consuming an existing lock, reuse the exact locked artifacts for
+the target. The presence of an alternative cached wheel does not
+authorize changing the dependency selection.
+
+
+Demonstration criteria
+----------------------
+
+- Complete compatible wheelhouse, empty tool cache:
+  zero wheel downloads during lock creation and acquisition.
+
+- One required artifact missing:
+  download only that artifact; retain the other eligible cached wheels,
+  even if newer eligible versions are available remotely.
+
+- Mixed Python versions, ABIs, platforms, or CPU/CUDA variants:
+  select compatible artifacts; if only incompatible wheels are cached,
+  acquire the correct missing wheel.
+
+- Prepared lock and wheelhouse:
+  install successfully in a fresh container with networking disabled,
+  without relying on a previously populated installer cache.
+
+- Missing or hash-conflicting locked artifact during offline build:
+  fail without modifying the lock or acquiring anything.
+
+These are requirements and acceptance criteria, not an endorsement of
+any particular implementation.
