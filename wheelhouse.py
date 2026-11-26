@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -361,6 +361,17 @@ class Links(HTMLParser):
             self.links.append(dict(attrs))
 
 
+@dataclass(frozen=True)
+class PackageSource:
+    """Distinguish an index root from an explicitly addressed package listing."""
+
+    url: str
+    is_page: bool = False
+
+    def listing_url(self, package):
+        return self.url if self.is_page else self.url.rstrip("/") + "/" + package + "/"
+
+
 def read_project(path):
     with path.open("rb") as stream:
         data = tomllib.load(stream)
@@ -395,29 +406,34 @@ def read_project(path):
     if "index" not in settings:
         raise ValueError("Declare tool.wheelhouse.index in the project file")
 
-    indexes = {"default": settings["index"]}
+    sources = {"default": PackageSource(settings["index"])}
 
     for (name, source) in settings.get("sources", {}).items():
         normalized = canonicalize_name(name, validate=True)
 
-        if normalized in indexes:
+        if normalized in sources:
             raise ValueError(f"Duplicate or reserved package source: {name=!s}")
 
-        indexes[normalized] = source
+        if isinstance(source, str):
+            sources[normalized] = PackageSource(source)
+        elif isinstance(source, dict) and (set(source) == {"page"}) and isinstance(source["page"], str):
+            sources[normalized] = PackageSource(source["page"], is_page=True)
+        else:
+            raise ValueError(f"Declare an index URL or a table containing only an HTTPS page URL for package source {name=!s}")
 
-    for source in indexes.values():
-        parts = validate_url(source)
+    for source in sources.values():
+        parts = validate_url(source.url)
 
         if parts.query or parts.fragment:
-            raise ValueError(f"Index URLs must be plain base URLs: {source=!s}")
+            raise ValueError(f"Package source URLs must not contain a query or fragment: {source.url=!s}")
 
-    return (requirements, indexes, fields)
+    return (requirements, sources, fields)
 
 
 def lock_project(project, pool, output):
     """Give uv metadata and two views of each declared publisher; never wheel bytes."""
     (project, pool, output) = map(Path, (project, pool, output))
-    (requirements, indexes, marker_names) = read_project(project)
+    (requirements, sources, marker_names) = read_project(project)
 
     if output.resolve().is_relative_to(pool.resolve()):
         raise ValueError("Write the project lock outside the shared wheelhouse")
@@ -440,8 +456,9 @@ def lock_project(project, pool, output):
 
     @lru_cache(maxsize=None)
     def page(package):
-        index = indexes.get(package, indexes["default"])
-        address = index.rstrip("/") + "/" + package + "/"
+        source = sources.get(package, sources["default"])
+        index = source.url
+        address = source.listing_url(package)
 
         try:
             with urllib.request.urlopen(urllib.request.Request(address, headers={"Accept": "text/html"}), timeout=30) as response:
@@ -712,7 +729,7 @@ def lock_project(project, pool, output):
 
         for package in document.packages:
             name = package.name
-            index = indexes.get(name, indexes["default"])
+            index = sources.get(name, sources["default"]).url
             identity = (index, name, package.version)
             digests = observed.get(identity, set())
 

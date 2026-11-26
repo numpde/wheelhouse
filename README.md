@@ -113,7 +113,23 @@ index = "https://pypi.org/simple"
 ```
 
 An optional `[tool.wheelhouse.sources]` table maps individual package names to
-other HTTPS indexes. Source builds, dynamic dependencies, and direct dependency
+other HTTPS indexes. To use a raw HTML file instead of an index directory, give
+that package an explicit page URL:
+
+```toml
+[tool.wheelhouse.sources.provider-core]
+page = "https://raw.githubusercontent.com/numpde/nmr-provider-tools/<commit>/simple/provider-core.html"
+```
+
+Replace `<commit>` with the commit containing the published listing. This is
+the planned SDK listing location; use it after that release's listing has been
+published. The page must link to wheels with SHA-256 hashes. For wheels missing
+from the pool, it must also advertise a metadata sidecar at the wheel URL plus
+`.metadata`, preferably with its own hash. Wheelhouse requests the exact page
+URL and resolves relative wheel links against its final URL after redirects.
+Pinning the listing to a commit keeps its wheel selection and hashes stable.
+
+Source builds, dynamic dependencies, and direct dependency
 URLs are unsupported. Publishers must supply separate dependency metadata when
 a verified wheel is unavailable locally. Missing required metadata fails lock
 creation without downloading wheel bytes or replacing the existing lock.
