@@ -22,20 +22,23 @@ Choose an existing Docker context explicitly. For example:
 
 ```sh
 cd /home/ra/repos/wheelhouse &&
-./prove science --real
+make proof ENGINE_CONTEXT=science
 ```
 
-This explicitly builds `wheelhouse:proof` in that context. The synthetic cases
-run without external networking. `--real` additionally resolves and acquires
-Requests and NumPy from PyPI. Each closure is then checked and installed in a
-fresh container with networking disabled and its inputs mounted read-only.
-All Python and packaging tools run inside containers.
+The [Makefile](Makefile) contains the proof commands directly. It explicitly
+builds `wheelhouse:proof`, resolves and acquires Requests and NumPy from PyPI,
+then widens their requirements and checks that the existing selection is
+retained with zero further wheel downloads. A fresh container checks and
+installs the closure with networking disabled and inputs mounted read-only.
+It also checks failures for missing wheels and missing or conflicting metadata
+evidence. All Python and packaging tools run inside containers.
 
 Trial files and downloads live at `/trial` inside a temporary Docker volume
 named `wheelhouse-proof-...`. The volume is removed afterward; the prepared
 tools image remains. The proof does not need the operator's existing wheel
 folder. [GitHub Actions](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
-runs this same entry point. Omit `--real` for the synthetic proof alone.
+runs this same Make target. `make image ENGINE_CONTEXT=science` prepares only
+the tools image.
 
 ## Use an existing shared wheel folder
 
@@ -131,7 +134,8 @@ marker values are recorded only when consulted by dependency markers. Other
 machines must match that target and have compatible wheel tags; this is not
 a cross-platform resolution. No persistent resolver cache is required.
 
-The proof exercises synthetic CPU/CUDA source selection and real
-Requests/NumPy installation. Real Torch/CUDA acquisition and an operator's
+The Makefile proof covers the real Requests/NumPy flow and the basic failures
+above. It does not run the former synthetic fixtures for backtracking,
+publisher routing, or redirects. Real Torch/CUDA acquisition and an operator's
 existing wheel folder remain separate trials. Publishers without the required
 sidecars can be used only when the needed exact wheel is already in the pool.
