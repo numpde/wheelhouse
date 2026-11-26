@@ -56,14 +56,14 @@ licenses, and metadata; it does not include Python or uv. No host Python is
 needed for these Docker examples.
 
 With `curl` and `sha256sum` on the host, download the bundle from the pinned
-[v0.1.0 release](https://github.com/numpde/wheelhouse/releases/tag/v0.1.0) and
+[v0.1.1 release](https://github.com/numpde/wheelhouse/releases/tag/v0.1.1) and
 verify it against the recorded checksum below. Use a dedicated folder; these
 commands replace `wheelhouse.pyz` there:
 
 ```sh
-version=v0.1.0
+version=v0.1.1
 release="https://github.com/numpde/wheelhouse/releases/download/$version"
-expected_sha256=1aebab862022865202bcb245f5671dea2034bdcf19cb91bc5a37b6a965847f0a
+expected_sha256=856991014e8c2d6f07e9e2f2984e6438ce237d0ac92e6962143125d42f829b84
 mkdir -p vendor/wheelhouse
 curl --fail --location "$release/wheelhouse.pyz" \
   --output vendor/wheelhouse/wheelhouse.pyz
@@ -118,12 +118,14 @@ that package an explicit page URL:
 
 ```toml
 [tool.wheelhouse.sources.provider-core]
-page = "https://raw.githubusercontent.com/numpde/nmr-provider-tools/<commit>/simple/provider-core.html"
+page = "https://raw.githubusercontent.com/numpde/nmr-provider-tools/4721f8ba64011fd231cab7ff230decafc7252022/simple/provider-core.html"
 ```
 
-Replace `<commit>` with the commit containing the published listing. This is
-the planned SDK listing location; use it after that release's listing has been
-published. The page must link to wheels with SHA-256 hashes. For wheels missing
+This example pins the published provider-core 0.7.8 listing. Add
+`provider-core[api]==0.7.8` to your project dependencies to use it. When upgrading,
+update the dependency and listing commit together.
+
+The page must link to wheels with SHA-256 hashes. For wheels missing
 from the pool, it must also advertise a metadata sidecar at the wheel URL plus
 `.metadata`, preferably with its own hash. Wheelhouse requests the exact page
 URL and resolves relative wheel links against its final URL after redirects.
