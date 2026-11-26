@@ -104,7 +104,7 @@ import zipfile
 from pathlib import Path
 
 from packaging.markers import default_environment
-from packaging.metadata import Metadata
+from packaging.metadata import Metadata, parse_email
 from packaging.pylock import Pylock
 from packaging.utils import canonicalize_name, parse_wheel_filename
 from wheelhouse_tool import __main__ as sdk
@@ -139,8 +139,16 @@ def marker_fields(marker):
 
 def validate_metadata(content, filename):
     """Validate exact wheel metadata and report the target fields it consults."""
+    # Resolution uses these fields. Older wheels can contain unrelated legacy
+    # headers (for example License-File) that are not valid under newer schemas.
+    # The evidence still hashes every byte, including those unrelated headers.
+    fields = {"metadata_version", "name", "version", "requires_dist", "requires_python", "provides_extra"}
+    raw, unparsed = parse_email(content)
+    invalid = set(unparsed).intersection(field.replace("_", "-") for field in fields)
+    if invalid:
+        raise ValueError(f"{filename}: invalid dependency METADATA fields: {sorted(invalid)}")
     try:
-        metadata = Metadata.from_email(content, validate=True)
+        metadata = Metadata.from_raw({key: value for key, value in raw.items() if key in fields}, validate=True)
     except ExceptionGroup as error:
         raise ValueError(f"{filename}: invalid METADATA: {error.exceptions!r}") from error
     name, version, _build, _tags = parse_wheel_filename(filename)

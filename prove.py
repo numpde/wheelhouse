@@ -250,13 +250,15 @@ def prepare(root):
         missing = publisher.add(make_wheel("wh-no-metadata", "1.0", sidecar=False))
         invalid = publisher.add(make_wheel("wh-invalid-metadata", "1.0"))
         invalid.sidecar = b"Metadata-Version: 2.3\nName: wh-invalid-metadata\nVersion: invalid\n\n"
+        duplicate = publisher.add(make_wheel("wh-duplicate-python", "1.0"))
+        duplicate.sidecar = b"Metadata-Version: 2.3\nName: wh-duplicate-python\nVersion: 1.0\nRequires-Python: >=3\nRequires-Python: <3\n\n"
         direct = publisher.add(make_wheel("wh-direct-reference", "1.0", ("unsafe @ https://example.invalid/unsafe.whl",)))
         redirect = publisher.add(make_wheel("wh-redirect", "1.0"))
         redirect.redirect = "http://example.invalid/metadata"
         wheel_redirect = publisher.add(make_wheel("wh-wheel-redirect", "1.0"))
         wheel_redirect.redirect = f"{publisher.index()}/files/{wheel_redirect.filename}"
         for wheel, diagnostic in (
-            (missing, "metadata"), (invalid, "metadata"), (direct, "direct"),
+            (missing, "metadata"), (invalid, "metadata"), (duplicate, "metadata"), (direct, "direct"),
             (redirect, "https"), (wheel_redirect, "wheel"),
         ):
             project(other_project, [f"{wheel.name}=={wheel.version}"], publisher.index())
