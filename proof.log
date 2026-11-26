@@ -1,24 +1,25 @@
-WARN Range requests not supported for kernel-1.0+cpu-cp313-cp313-linux_x86_64.whl; streaming wheel
+Partial resolver-only proof (not Docker or released SDK evidence).
+Command: python -B prove.py --resolver-only
+Existing isolated environment: CPython 3.13.5, uv 0.10.0, packaging 25.0.
+TOML writer supplied by pip._vendor.tomli_w via a temporary import shim.
+No dependency installations. Selected output lines from the successful run:
+
 Lock-generation wheel downloads: 0
 PASS complete, mixed pool: no wheel downloads
-WARN Range requests not supported for kernel-1.0+cpu-cp313-cp313-linux_x86_64.whl; streaming wheel
 DOWNLOAD leaf-1.0-py3-none-any.whl
-WARN Range requests not supported for leaf-1.0-py3-none-any.whl; streaming wheel
 Lock-generation wheel downloads: 1
-PASS partial pool: exactly the missing wheel downloaded; older eligible cached helper retained
+PASS partial pool: only the missing wheel downloaded
 DOWNLOAD kernel-1.0+cpu-cp313-cp313-linux_x86_64.whl
-WARN Range requests not supported for kernel-1.0+cpu-cp313-cp313-linux_x86_64.whl; streaming wheel
-WARN Range requests not supported for helper-1.0-py3-none-any.whl; streaming wheel
 Lock-generation wheel downloads: 1
-PASS incompatible cached ABI/backend cannot satisfy the CPU pin
+PASS incompatible cached ABI/backend/platform cannot satisfy the CPU pin; explicit source used
+PASS newest eligible cached helper preferred over newer remote version
 PASS portable source and hash identities
-Using CPython 3.13.5 interpreter at: /opt/pyvenv/bin/python
-Creating virtual environment at: /tmp/tmptwh3ab45/venv
-warning: The `--pylock` option is experimental and may change without warning. Pass `--preview-features pylock` to disable this warning.
-Using Python 3.13.5 environment at: /tmp/tmptwh3ab45/venv
-Prepared 3 packages in 4ms
-Installed 3 packages in 1ms
- + helper==1.0
- + kernel==1.0+cpu
- + leaf==1.0
+Lock-generation wheel downloads: 0
+PASS resolver backtracking to remote version using metadata only
+PASS publisher redirect failure reaches command boundary; lock unchanged
 PASS offline install with publisher stopped
+PARTIAL PROOF ONLY: released SDK acquisition and offline check not exercised
+
+The expected redirect failure produced uv HTTP 502 retry diagnostics before
+the adapter reported its cause. Range requests were not supported for wheels
+without published sidecars. The command exited successfully.
