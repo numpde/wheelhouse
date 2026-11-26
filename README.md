@@ -28,7 +28,8 @@ offline.
 
 Each lock applies to a matching Python version and platform. The current tests
 demonstrate Requests and NumPy acquisition, reuse, and offline installation.
-Source builds are outside its scope; Torch/CUDA has not been qualified.
+Source builds are outside its scope. ChefNMR2 has qualified its Torch CPU/CUDA
+installation environments; model and GPU execution remain consumer-owned.
 
 ## Prepare the tool
 
