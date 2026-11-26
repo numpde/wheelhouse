@@ -30,38 +30,75 @@ Each lock applies to a matching Python version and platform. The current tests
 demonstrate Requests and NumPy acquisition, reuse, and offline installation.
 Source builds are outside its scope; Torch/CUDA has not been qualified.
 
-## Build and test the tool
+## Prepare the tool
 
-Run `make` to list workflows. Pass a local Docker context on the command line,
-or omit it to choose at the terminal; environment values never select it.
-The Make entrypoint and input selection are copied and adapted from ChefNMR2.
-From this checkout, run:
-
-```sh
-make test DOCKER_CONTEXT=science
-```
-
-This builds the pinned tools image, runs the repository checks, creates
-`dist/wheelhouse.pyz`, and tests that bundle. The artifact tests run without
-Python site packages; the integration tests acquire Requests and NumPy online,
-then install them in a fresh container with networking disabled. Temporary test
-containers and the shared test volume are removed after the run.
-
-The individual targets are:
+The examples below run in Docker. You need its CLI and a running local engine
+whose context uses a Unix socket. In one shell, list your contexts and select
+one you already use; replace `default` if needed:
 
 ```sh
-make tests/repo-checks DOCKER_CONTEXT=science
-make tests/unit DOCKER_CONTEXT=science
-make tests/integration DOCKER_CONTEXT=science
-make package DOCKER_CONTEXT=science
+docker context ls
+context=default
 ```
 
-`package` produces `dist/wheelhouse.pyz` and `dist/SHA256SUMS`. The bundle includes
-its Python dependencies and their installed license and metadata files. It
-requires Python and, for lock creation, the uv executable. The tested versions
-are pinned in [Dockerfile](Dockerfile). No host Python installation is needed.
-Image preparation can use the network; bundle creation and repository checks
-run without network access. Rebuilding replaces the outputs in `dist/`.
+Choose **one** preparation route. Both set `image` and `bundle` for the same
+[lock, acquire](#create-the-lock-and-acquire-wheels), and
+[offline install](#install-offline) commands below. Preparation and locking need
+network access; acquisition needs it for missing wheels. Offline installation
+starts after those inputs are ready.
+
+### Use a released bundle with your target image
+
+Use this route if you already have a local Linux target image providing `sh`,
+Python, and uv on `PATH`. The tested versions are Python 3.13.18 and uv 0.10.0,
+pinned in [Dockerfile](Dockerfile). The bundle includes its Python dependencies,
+licenses, and metadata; it does not include Python or uv. No host Python is
+needed for these Docker examples.
+
+With `curl` and `sha256sum` on the host, download the bundle from the pinned
+[v0.1.0 release](https://github.com/numpde/wheelhouse/releases/tag/v0.1.0) and
+verify it against the recorded checksum below. Use a dedicated folder; these
+commands replace `wheelhouse.pyz` there:
+
+```sh
+version=v0.1.0
+release="https://github.com/numpde/wheelhouse/releases/download/$version"
+expected_sha256=1aebab862022865202bcb245f5671dea2034bdcf19cb91bc5a37b6a965847f0a
+mkdir -p vendor/wheelhouse
+curl --fail --location "$release/wheelhouse.pyz" \
+  --output vendor/wheelhouse/wheelhouse.pyz
+(cd vendor/wheelhouse && \
+  printf '%s  wheelhouse.pyz\n' "$expected_sha256" | sha256sum --check -)
+bundle="$PWD/vendor/wheelhouse/wheelhouse.pyz"
+image=your-project:prepared
+```
+
+Replace `your-project:prepared` with that existing image. Expect
+`wheelhouse.pyz: OK`; stop if verification fails. Record the release URL and
+expected SHA-256 in your project's preparation configuration so future runs
+verify the same artifact. When upgrading, update the version and expected
+checksum together using the new release's checksum.
+
+### Or build the tools image and bundle from source
+
+Use this route for the complete example when you do not have a target image.
+You also need Git, GNU Make, and Bash on the host. From an existing checkout,
+skip the clone and `cd` commands:
+
+```sh
+git clone https://github.com/numpde/wheelhouse.git
+cd wheelhouse
+make package DOCKER_CONTEXT="$context"
+image=wheelhouse:proof
+bundle="$PWD/dist/wheelhouse.pyz"
+```
+
+This builds the pinned tools image and writes `dist/wheelhouse.pyz` and
+`dist/SHA256SUMS`. Rebuilding replaces those outputs. The image provides Python
+and uv for the demonstration; it does not build or deploy your application.
+For application use, prepare your own target image with Python and uv as
+described above, then set `image` to its name before running `lock` below.
+Keep `image=wheelhouse:proof` to follow this demonstration.
 
 ## Declare your project's dependencies
 
@@ -83,19 +120,22 @@ creation without downloading wheel bytes or replacing the existing lock.
 
 ## Create the lock and acquire wheels
 
-After building the tool, set these paths in one shell. Replace the project and
-pool paths with your own absolute paths; keep the pool outside your project.
+Continue in the same shell used to prepare the tool. Set your existing project
+folder and a shared wheel folder to absolute paths; keep the pool outside your
+project. The project folder must contain the `pyproject.toml` from above.
 
 ```sh
-context=science
-image=wheelhouse:proof
-bundle="$PWD/dist/wheelhouse.pyz"
 project=/absolute/path/to/your-project
 pool=/absolute/path/to/shared-wheels
 mkdir -p "$pool"
 ```
 
-Create a lock for the Python version and platform inside the tools container:
+Use the same target image for locking, acquisition, and installation. The lock
+records the running interpreter and platform, including the Python patch
+version and ABI (the binary interface used by compiled packages). A different
+target is rejected; regenerate the lock in the intended target image.
+
+Create the lock online:
 
 ```sh
 docker --context "$context" run --rm --pull never \
@@ -123,7 +163,10 @@ docker --context "$context" run --rm --pull never \
 ```
 
 Repeating acquisition verifies and reuses existing files. A conflicting file
-causes a failure and remains in place for inspection.
+causes a failure and remains in place for inspection. If a later download
+fails, earlier verified wheels remain in the pool; retrying acquisition reuses
+them. Successful acquisition prints JSON listing the selected `artifacts` and
+newly `downloaded` filenames; a fully populated pool has `"downloaded": []`.
 
 ## Install offline
 
@@ -139,7 +182,7 @@ docker --context "$context" run --rm --pull never --network none \
     python -S /tool.pyz check --lock /project/wheelhouse.lock \
       --pool /wheels --local-lock /tmp/pylock.toml
     uv --no-config --no-cache venv /tmp/venv \
-      --python /usr/local/bin/python --no-python-downloads
+      --python "$(command -v python)" --no-python-downloads
     uv --no-config --no-cache pip sync --offline --no-index \
       --no-python-downloads --only-binary=:all: --require-hashes \
       --python /tmp/venv/bin/python /tmp/pylock.toml
@@ -147,27 +190,65 @@ docker --context "$context" run --rm --pull never --network none \
   '
 ```
 
-The final import matches the example dependencies; change it for your project.
-The container and installed environment disappear on exit. For a deployable
-application, perform these steps in its image build and retain the installed
-environment in the resulting image. Use the application's target interpreter
-for both lock creation and consumption. A lock for another Python version,
-ABI, OS, or architecture is rejected. Additional targets need qualification;
+A zero exit status from the final import confirms the example packages installed
+without network access; it prints nothing on success. Change the imports for
+your project. The container and installed environment disappear on exit. For a
+deployable application, perform these steps in its image build and retain the
+installed environment in the resulting image. Additional targets need qualification;
 the current proof exercises Linux CPython 3.13.
 
 The temporary `pylock.toml` contains local paths. Do not commit or distribute it;
 share the authoritative `wheelhouse.lock` instead.
 
-## Publish and consume a release
+## Reuse the pool or prepare another machine
 
-Publish the zipapp and checksum as assets of a versioned GitHub release. This
-follows the provider-tools artifact model without coupling releases to its SDK.
-Publishing requires Git and an authenticated GitHub CLI (`gh`) on the host.
+For a second project, use the same pool path and that project's own
+`pyproject.toml` and `wheelhouse.lock`. Run `lock` and `acquire` again; compatible
+cached wheels are preferred and reused. Locking still contacts publishers.
+After changing dependencies, regenerate the lock, review and commit it, then
+acquire any newly selected wheels.
+
+Keep the shared wheel pool and commit each project's authoritative
+`wheelhouse.lock`. Regenerate the temporary `pylock.toml` wherever you install,
+because it contains local paths. Do not commit or transfer that temporary file.
+
+Before using an offline destination, prepare its matching target image, the
+verified tool bundle, its project lock, and every wheel required by that lock.
+Run `check` there and generate a new local projection before installation. An
+online destination can instead acquire missing wheels from their locked URLs.
+
+## Build and test changes
+
+From a checkout, run `make` to list workflows. Pass `DOCKER_CONTEXT` explicitly,
+or omit it to choose at the terminal; environment values never select it.
+The Make entrypoint and input selection are copied and adapted from ChefNMR2.
+
+```sh
+make test DOCKER_CONTEXT="$context"
+```
+
+This builds the tools image and bundle, runs repository and artifact checks,
+acquires Requests and NumPy online, and installs them in a fresh container with
+networking disabled. Temporary containers and the test volume are removed.
+Image preparation may use the network; packaging and repository checks run
+offline. The individual test targets are:
+
+```sh
+make tests/repo-checks DOCKER_CONTEXT="$context"
+make tests/unit DOCKER_CONTEXT="$context"
+make tests/integration DOCKER_CONTEXT="$context"
+```
+
+## Publish a release
+
+Maintainers publish the bundle and checksum as assets of a versioned GitHub
+release. Work from a clean checkout with Git, Make, Bash, a local Docker engine,
+and an authenticated GitHub CLI (`gh`) with release access to this repository.
 Write the release notes as `notes/NNN_release_vX.Y.Z.md`, keeping each paragraph
 or list item on one source line. Commit the source and notes, then run:
 
 ```sh
-make publish/release DOCKER_CONTEXT=science
+make publish/release DOCKER_CONTEXT="$context"
 ```
 
 The highest version in the release-note filenames determines the tag; for
@@ -188,14 +269,3 @@ source and test log. Inspect any remote release and tag before retrying;
 a lost response to the final publish request can leave publication uncertain.
 Successful runs remove their temporary directory.
 Ordinary builds and CI never publish releases.
-
-Consumers should pin the release URL and expected SHA-256 in their preparation
-configuration. Download and verify the bundle during explicit preparation,
-then copy or mount it into the target container. Run it with
-`python -S /path/to/wheelhouse.pyz`; it does not install packages into the
-application environment. Supply the tested uv version for `lock` and offline
-installation. The native uv executable is separate from the Python bundle.
-
-For an offline destination, prepare its target image, the verified tool bundle,
-the project's `wheelhouse.lock`, and every wheel required by that lock before
-transfer. An online destination can acquire the wheels from their locked URLs.
