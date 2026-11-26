@@ -1,0 +1,39 @@
+#!/bin/sh
+# Prepare the tools image, prove the contract, then install in a fresh offline container.
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    echo "Usage: $0 DOCKER_CONTEXT [--real]" >&2
+    exit 2
+fi
+context=$1
+real=${2-}
+if [ -n "$real" ] && [ "$real" != --real ]; then
+    echo "Expected --real as the optional second argument" >&2
+    exit 2
+fi
+repository=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+image=wheelhouse:proof
+volume="wheelhouse-proof-$(date +%s)-$$"
+
+# Image acquisition belongs to this explicit preparation step.
+docker --context "$context" build --tag "$image" "$repository"
+docker --context "$context" volume create "$volume" >/dev/null
+trap 'docker --context "$context" volume rm "$volume" >/dev/null || true' 0
+
+run_proof() {
+    network=$1
+    access=$2
+    mode=$3
+    docker --context "$context" run --rm --pull never --network "$network" \
+        --mount "type=bind,src=$repository,dst=/proof,readonly" \
+        --mount "type=volume,src=$volume,dst=/trial$access" \
+        --entrypoint python "$image" /proof/prove.py "$mode" /trial
+}
+
+run_proof none '' prepare
+run_proof none ',readonly' offline
+if [ "$real" = --real ]; then
+    run_proof bridge '' prepare-real
+    run_proof none ',readonly' offline-real
+fi

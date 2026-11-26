@@ -1,0 +1,19 @@
+name: Wheelhouse proof
+
+on:
+  push:
+    branches: [main]
+    paths: [wheelhouse.py, Dockerfile, prove, prove.py, .github/workflows/proof.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Run the same container proof as an operator
+        run: ./prove default --real
