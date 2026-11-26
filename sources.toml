@@ -1,0 +1,2 @@
+default = "https://pypi.org/simple"
+torch = "https://download.pytorch.org/whl/cpu"
