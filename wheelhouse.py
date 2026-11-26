@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 import tomli_w
 from packaging.markers import default_environment
 from packaging.metadata import Metadata, parse_email
-from packaging.pylock import Pylock, is_valid_pylock_path
+from packaging.pylock import PackageWheel, Pylock, is_valid_pylock_path
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.tags import sys_tags
@@ -116,6 +116,11 @@ def marker_fields(marker):
     }
 
 
+def validate_wheel_filename(filename):
+    if ("/" in filename) or ("\\" in filename) or any(((ord(character) < 32) or (ord(character) == 127)) for character in filename):
+        raise ValueError(f"Unsafe wheel filename: {filename=!r}")
+
+
 def validate_metadata(content, filename):
     """Validate exact wheel metadata and report the target fields it consults."""
 
@@ -175,9 +180,9 @@ def wheel_file(path, digest=None, directory_fd=None):
 
 def wheel_metadata(stream):
     with zipfile.ZipFile(stream) as archive:
-        entries = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+        entries = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA") and (name.count("/") == 1)]
 
-        if (len(entries) != 1) or (entries[0].count("/") != 1):
+        if len(entries) != 1:
             raise ValueError("Expected exactly one root .dist-info/METADATA")
 
         return archive.read(entries[0])
@@ -217,27 +222,147 @@ def acquisition_lock(pool):
             yield directory_fd
 
 
-def verify_wheel(path, wheel, evidence, directory_fd=None):
-    """Use the same artifact and metadata checks for cached and downloaded wheels."""
-    digest = wheel.hashes["sha256"]
+def verified_metadata(path, wheel, metadata_digest=None, directory_fd=None):
+    """Read metadata only after verifying the exact wheel bytes and identity."""
 
     try:
-        with wheel_file(path, digest, directory_fd) as stream:
-            if hashlib.sha256(wheel_metadata(stream)).hexdigest() != evidence[digest]:
-                raise ValueError("Embedded METADATA differs from resolution metadata")
+        with wheel_file(path, wheel.hashes["sha256"], directory_fd) as stream:
+            data = wheel_metadata(stream)
+
+        validate_metadata(data, wheel.filename)
+        (raw, _) = parse_email(data)
+        requires_python = raw.get("requires_python")
+
+        if requires_python and not SpecifierSet(requires_python).contains(platform.python_version(), prereleases=True):
+            raise ValueError(f"Wheel requires Python {requires_python=!s}; running {platform.python_version()=!s}")
+
+        if (metadata_digest is not None) and (hashlib.sha256(data).hexdigest() != metadata_digest):
+            raise ValueError("Embedded METADATA differs from resolution metadata")
+
+        return data
     except FileNotFoundError:
         raise
     except Exception as error:
-        raise ValueError(f"{wheel.filename=!s} from {wheel.url=!s}: {error=!s}") from error
+        raise ValueError(f"{wheel.filename=!s} from {wheel.url or wheel.path=!s}: {error=!s}") from error
+
+
+def verify_wheel(path, wheel, evidence, directory_fd=None):
+    """Use the same artifact and metadata checks for cached and downloaded wheels."""
+
+    return verified_metadata(path, wheel, evidence[wheel.hashes["sha256"]], directory_fd)
+
+
+def acquire_wheel(wheel, pool, directory_fd, metadata_digest=None):
+    """Verify an existing wheel, or stage, verify and publish one missing wheel.
+
+    The caller holds the acquisition lock while admitting a remote artifact.
+    Existing conflicting bytes remain untouched.
+    """
+
+    try:
+        verified_metadata(wheel.filename, wheel, metadata_digest, directory_fd)
+
+        return False
+    except FileNotFoundError:
+        pass
+
+    with tempfile.TemporaryDirectory(prefix=".wheelhouse-", dir=pool) as temporary, network_policy():
+        staged = Path(temporary) / wheel.filename
+
+        try:
+            with urllib.request.urlopen(wheel.url, timeout=60) as source, staged.open("xb") as target:
+                shutil.copyfileobj(source, target)
+        except Exception as error:
+            raise RuntimeError(f"{wheel.filename=!s} from {wheel.url=!s}: {error=!s}") from error
+
+        verified_metadata(staged, wheel, metadata_digest)
+        os.link(staged, wheel.filename, dst_dir_fd=directory_fd, follow_symlinks=False)
+
+    return True
+
+
+def wheel_source(wheel, pool):
+    return Path(wheel.path) if wheel.path is not None else pool / wheel.filename
 
 
 def local_lock(document, pool, artifacts):
     packages = [
-        replace(package, wheels=[replace(wheel, url=None, path=str(pool / wheel.filename))])
+        replace(package, wheels=[replace(wheel, url=None, path=str(wheel_source(wheel, pool)))])
         for (package, wheel) in artifacts
     ]
 
     return tomli_w.dumps(replace(document, packages=packages).to_dict())
+
+
+def artifact_entries(artifacts, pool):
+    return [
+        {
+            "package": package.name,
+            "version": str(package.version),
+            "filename": wheel.filename,
+            "sha256": wheel.hashes["sha256"],
+            "source_path": str(wheel_source(wheel, pool)),
+        }
+        for (package, wheel) in artifacts
+    ]
+
+
+def installation_paths(entries, destination_map):
+    if destination_map is None:
+        return [Path(entry["source_path"]) for entry in entries]
+
+    if (not isinstance(destination_map, dict)) or (set(destination_map) != {"artifacts"}):
+        raise ValueError("The destination map must contain only an artifacts array")
+
+    mappings = destination_map["artifacts"]
+
+    if not isinstance(mappings, list):
+        raise ValueError("The destination map artifacts value must be an array")
+
+    expected = {(entry["source_path"], entry["sha256"]): entry for entry in entries}
+    paths = {}
+
+    for mapping in mappings:
+        if (not isinstance(mapping, dict)) or (set(mapping) != {"source_path", "sha256", "destination"}):
+            raise ValueError("Each destination mapping must contain source_path, sha256 and destination")
+
+        if not all(isinstance(value, str) for value in mapping.values()):
+            raise ValueError("Destination mapping values must be strings")
+
+        identity = (mapping["source_path"], mapping["sha256"])
+
+        if identity not in expected:
+            raise ValueError(f"The destination map contains an unselected wheel: {identity=!r}")
+
+        if identity in paths:
+            raise ValueError(f"The destination map repeats a wheel: {identity=!r}")
+
+        destination = Path(mapping["destination"])
+
+        if (not destination.is_absolute()) or (str(destination) != mapping["destination"]) or (".." in destination.parts):
+            raise ValueError(f"A destination must be a canonical absolute path: {destination=!s}")
+
+        if destination.name != expected[identity]["filename"]:
+            raise ValueError(f"A destination must retain the selected wheel filename: {destination=!s}")
+
+        if any(((destination == other) or (destination in other.parents) or (other in destination.parents)) for other in paths.values()):
+            raise ValueError(f"Wheel destinations collide: {destination=!s}")
+
+        paths[identity] = destination
+
+    missing = expected.keys() - paths.keys()
+
+    if missing:
+        raise ValueError(f"The destination map is missing selected wheels: {sorted(missing)=!r}")
+
+    return [paths[(entry["source_path"], entry["sha256"])] for entry in entries]
+
+
+def pip_requirements(entries, paths):
+    return "".join(
+        f"{path.as_uri()} --hash=sha256:{entry['sha256']}\n"  # machine-string: pip requires a file URI followed by its exact hash option.
+        for (entry, path) in zip(entries, paths, strict=True)
+    )
 
 
 def registry_wheels(package):
@@ -266,19 +391,31 @@ def load_locked(lock):
     document = Pylock.from_dict(envelope["resolution"])
 
     for package in document.packages:
-        validate_url(package.index)
+        wheels = registry_wheels(package)
+        local = [(wheel.path is not None) for wheel in wheels]
 
-        for wheel in registry_wheels(package):
-            validate_url(wheel.url)
+        if any(local):
+            if not all(local) or (package.index is not None):
+                raise ValueError(f"{package.name=!s}: local wheels must have local provenance exclusively")
+        else:
+            validate_url(package.index)
+
+        for wheel in wheels:
+            if wheel.path is not None:
+                if (wheel.url is not None) or not Path(wheel.path).is_absolute():
+                    raise ValueError(f"{package.name=!s}: local wheel requires an absolute path without a URL")
+            else:
+                validate_url(wheel.url)
+
             name = wheel.filename
 
-            if ("/" in name) or ("\\" in name) or any(((ord(character) < 32) or (ord(character) == 127)) for character in name):
-                raise ValueError(f"{package.name=!s}: unsafe wheel filename {name=!r}")
+            validate_wheel_filename(name)
 
             digest = wheel.hashes.get("sha256")
 
             if not _sha256_text(digest) or not _sha256_text(evidence.get(digest)):
-                raise ValueError(f"{name=!s} from {wheel.url=!s}: required artifact hash or metadata evidence is absent")
+                raise ValueError(f"{name=!s} from {wheel.url or wheel.path=!s}: required artifact hash or metadata evidence is absent")
+
 
     return (envelope, document, list(document.select()))
 
@@ -288,16 +425,43 @@ def missing_wheels(artifacts, evidence, directory_fd):
 
     for (package, wheel) in artifacts:
         try:
-            verify_wheel(wheel.filename, wheel, evidence, directory_fd)
+            if wheel.path is not None:
+                verify_wheel(wheel.path, wheel, evidence)
+            else:
+                verify_wheel(wheel.filename, wheel, evidence, directory_fd)
         except FileNotFoundError:
+            if wheel.path is not None:
+                raise FileNotFoundError(f"Missing locked local wheel: {wheel.path=!s}") from None
+
             missing.append((package, wheel))
 
     return missing
 
 
-def consume(action, lock, pool, local_output=None):
+def consume(action, lock, pool, local_output=None, requirements_output=None, destination_map=None):
     """Consume the existing selection, publishing only completely verified wheels."""
-    (lock, pool) = (Path(lock), Path(pool))
+    (lock, pool) = (Path(lock).resolve(), Path(pool).resolve())
+    requirements_output = Path(requirements_output) if requirements_output is not None else None
+    map_path = Path(destination_map) if destination_map is not None else None
+    captured_map = json.loads(map_path.read_text(encoding="utf-8")) if map_path is not None else None
+
+    if (map_path is not None) and (requirements_output is None):
+        raise ValueError("A destination map requires a requirements output path")
+
+    outputs = [Path(path).resolve() for path in (local_output, requirements_output) if path is not None]
+
+    if len(outputs) > 1:
+        raise ValueError("Choose one installation projection: local lock or requirements")
+
+    for output in outputs:
+        if output == lock:
+            raise ValueError("A disposable installation projection must not replace the authoritative lock")
+
+        if (output == pool) or (pool in output.parents):
+            raise ValueError("Write disposable installation projections outside the shared wheel pool")
+
+        if (map_path is not None) and (output == map_path.resolve()):
+            raise ValueError("An installation projection must not replace its destination map")
 
     if local_output is not None:
         local_output = Path(local_output)
@@ -305,15 +469,15 @@ def consume(action, lock, pool, local_output=None):
         if not is_valid_pylock_path(local_output):
             raise ValueError("The local projection must be named pylock.toml or pylock.<name>.toml")
 
-        if local_output.resolve() == lock.resolve():
-            raise ValueError("A disposable local projection must not replace the authoritative lock")
-
-        if pool.resolve() in local_output.resolve().parents:
-            raise ValueError("Write the disposable local projection outside the shared wheel pool")
-
     (envelope, document, artifacts) = load_locked(lock)
     evidence = envelope["metadata"]
     downloaded = []
+    entries = artifact_entries(artifacts, pool)
+    paths = installation_paths(entries, captured_map)
+
+    for entry in entries:
+        if Path(entry["source_path"]).resolve() in outputs:
+            raise ValueError(f"An installation projection must not replace a selected wheel: {entry['source_path']=!s}")
 
     with pool_lock(pool) as directory_fd:
         missing = missing_wheels(artifacts, evidence, directory_fd)
@@ -328,27 +492,23 @@ def consume(action, lock, pool, local_output=None):
             # Another cooperating writer may have completed while we waited.
             missing = missing_wheels(missing, evidence, directory_fd)
 
-            with tempfile.TemporaryDirectory(prefix=".wheelhouse-", dir=pool) as temporary, network_policy():
-                for (_, wheel) in missing:
-                    staged = Path(temporary) / wheel.filename
-
-                    try:
-                        with urllib.request.urlopen(wheel.url, timeout=60) as source, staged.open("xb") as target:
-                            shutil.copyfileobj(source, target)
-                    except Exception as error:
-                        raise RuntimeError(f"{wheel.filename=!s} from {wheel.url=!s}: {error=!s}") from error
-
-                    verify_wheel(staged, wheel, evidence)
-                    os.link(staged, wheel.filename, dst_dir_fd=directory_fd, follow_symlinks=False)
+            for (_, wheel) in missing:
+                if acquire_wheel(wheel, pool, directory_fd, evidence[wheel.hashes["sha256"]]):
                     downloaded.append(wheel.filename)
-                    staged.unlink()
 
     if local_output is not None:
         projection = local_lock(document, pool.resolve(), artifacts)
 
         atomic_write(local_output, projection.encode("utf-8"))
 
-    return {"artifacts": [wheel.filename for (_, wheel) in artifacts], "downloaded": downloaded}
+    if requirements_output is not None:
+        atomic_write(requirements_output, pip_requirements(entries, paths).encode("utf-8"))
+
+    return {
+        "artifacts": [wheel.filename for (_, wheel) in artifacts],
+        "downloaded": downloaded,
+        "artifact_entries": entries,
+    }
 
 
 class Links(HTMLParser):
@@ -363,13 +523,77 @@ class Links(HTMLParser):
 
 @dataclass(frozen=True)
 class PackageSource:
-    """Distinguish an index root from an explicitly addressed package listing."""
+    """Bind a package to one publisher listing or one immutable wheel."""
 
-    url: str
+    url: str | None = None
     is_page: bool = False
+    path: Path | None = None
+    sha256: str | None = None
+
+    @property
+    def exact(self):
+        return self.sha256 is not None
 
     def listing_url(self, package):
         return self.url if self.is_page else self.url.rstrip("/") + "/" + package + "/"
+
+
+def source_artifact(package, source):
+    """Describe and validate an exact binding without opening wheel bytes."""
+    filename = source.path.name if source.path is not None else unquote(urlsplit(source.url).path.rsplit("/", 1)[-1])
+
+    validate_wheel_filename(filename)
+
+    (name, version, _, tags) = parse_wheel_filename(filename)
+
+    if name != package:
+        raise ValueError(f"Exact wheel {filename=!s} does not match package {package=!s}")
+
+    if not tags.intersection(sys_tags()):
+        raise ValueError(f"Exact wheel {filename=!s} is incompatible with the running target")
+
+    return {
+        "name": filename,
+        "sha256": source.sha256,
+        "url": source.url,
+        "index": source.url,
+        "package": name,
+        "version": version,
+        "tags": tags,
+        "metadata": None,
+        "path": source.path,
+    }
+
+
+def prepare_package(project, package, pool):
+    """Prepare one exact declaration without solving its dependencies."""
+    (_, sources, _) = read_project(Path(project))
+    package = canonicalize_name(package, validate=True)
+    source = sources.get(package)
+
+    if (source is None) or (not source.exact):
+        raise ValueError(f"Preparation requires an exact wheel and SHA-256 declaration for {package=!s}")
+
+    item = source_artifact(package, source)
+    wheel = PackageWheel(name=item["name"], url=source.url, path=str(source.path) if source.path is not None else None, hashes={"sha256": source.sha256})
+    downloaded = False
+
+    if source.path is not None:
+        verified_metadata(source.path, wheel)
+        path = source.path
+    else:
+        pool = Path(pool)
+
+        try:
+            with pool_lock(pool) as directory_fd:
+                verified_metadata(wheel.filename, wheel, directory_fd=directory_fd)
+        except FileNotFoundError:
+            with acquisition_lock(pool) as directory_fd:
+                downloaded = acquire_wheel(wheel, pool, directory_fd)
+
+        path = pool.resolve() / item["name"]
+
+    return {"artifacts": [item["name"]], "downloaded": [item["name"]] if downloaded else [], "path": str(path)}
 
 
 def read_project(path):
@@ -418,25 +642,49 @@ def read_project(path):
             sources[normalized] = PackageSource(source)
         elif isinstance(source, dict) and (set(source) == {"page"}) and isinstance(source["page"], str):
             sources[normalized] = PackageSource(source["page"], is_page=True)
+        elif isinstance(source, dict) and (set(source) in ({"wheel", "sha256"}, {"path", "sha256"})):
+            if not _sha256_text(source["sha256"]):
+                raise ValueError(f"Declare a lowercase 64-character SHA-256 for package source {name=!s}")
+
+            if "path" in source:
+                if not isinstance(source["path"], str) or (not source["path"]):
+                    raise ValueError(f"Declare a local wheel path for package source {name=!s}")
+
+                local = Path(os.path.abspath(path.parent / source["path"]))
+                sources[normalized] = PackageSource(path=local, sha256=source["sha256"])
+            else:
+                if not isinstance(source["wheel"], str):
+                    raise ValueError(f"Declare an HTTPS wheel URL for package source {name=!s}")
+
+                sources[normalized] = PackageSource(url=source["wheel"], sha256=source["sha256"])
         else:
-            raise ValueError(f"Declare an index URL or a table containing only an HTTPS page URL for package source {name=!s}")
+            raise ValueError(f"Declare an index URL or a table containing only page, wheel/sha256, or path/sha256 for package source {name=!s}")
 
-    for source in sources.values():
-        parts = validate_url(source.url)
+    for (name, source) in sources.items():
+        if source.url is not None:
+            parts = validate_url(source.url)
 
-        if parts.query or parts.fragment:
-            raise ValueError(f"Package source URLs must not contain a query or fragment: {source.url=!s}")
+            if parts.fragment or (parts.query and (not source.exact)):
+                raise ValueError(f"Package source URLs must not contain a query or fragment: {source.url=!s}")
+
+        if source.exact:
+            source_artifact(name, source)
 
     return (requirements, sources, fields)
 
 
-def lock_project(project, pool, output):
+def lock_project(project, pool, output, offline=False):
     """Give uv metadata and two views of each declared publisher; never wheel bytes."""
     (project, pool, output) = map(Path, (project, pool, output))
     (requirements, sources, marker_names) = read_project(project)
 
     if output.resolve().is_relative_to(pool.resolve()):
         raise ValueError("Write the project lock outside the shared wheelhouse")
+
+    inputs = {project.resolve()} | {source.path.resolve() for source in sources.values() if source.path is not None}
+
+    if output.resolve() in inputs:
+        raise ValueError("Write the project lock separately from its project and local wheel inputs")
 
     initial = {path.name for path in pool.iterdir()}
     tags = set(sys_tags())
@@ -457,6 +705,49 @@ def lock_project(project, pool, output):
     @lru_cache(maxsize=None)
     def page(package):
         source = sources.get(package, sources["default"])
+
+        if offline and (source.path is None):
+            if package in sources:
+                raise ValueError(f"Offline resolution requires a local wheel binding for explicitly sourced {package=!s}")
+
+            entries = []
+
+            for filename in sorted(initial):
+                if not filename.endswith(".whl"):
+                    continue
+
+                try:
+                    (name, _version, _build, wheel_tags) = parse_wheel_filename(filename)
+                except InvalidWheelFilename:
+                    continue
+
+                if (name != package) or not wheel_tags.intersection(tags):
+                    continue
+
+                path = pool.resolve() / filename
+
+                with wheel_file(path) as stream:
+                    checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+
+                candidate = PackageSource(url=None, path=path, sha256=checksum)
+                item = source_artifact(package, candidate)
+                identity = str(path) + "\n" + checksum
+                token = hashlib.sha256(identity.encode()).hexdigest()
+                artifacts[token] = item
+
+                entries.append((token, {}))
+
+            return entries
+
+        if source.exact:
+            artifact = source_artifact(package, source)
+            identity = str(source.path or source.url) + "\n" + source.sha256
+            token = hashlib.sha256(identity.encode()).hexdigest()
+
+            artifacts[token] = artifact
+
+            return [(token, {})]
+
         index = source.url
         address = source.listing_url(package)
 
@@ -491,7 +782,9 @@ def lock_project(project, pool, output):
             except InvalidWheelFilename:
                 continue
 
-            if ("/" in filename) or ("\\" in filename) or (name != package):
+            validate_wheel_filename(filename)
+
+            if name != package:
                 raise ValueError(f"Wrong artifact identity from {address=!s}: {filename=!s}")
 
             validate_url(source)
@@ -535,8 +828,11 @@ def lock_project(project, pool, output):
             if checksum is None:
                 raise ValueError("Publisher did not supply one valid artifact SHA-256")
 
-            if cached(filename, checksum):
-                with wheel_file(pool / filename) as stream:
+            if item.get("path") is not None:
+                with wheel_file(item["path"], checksum) as stream:
+                    data = wheel_metadata(stream)
+            elif cached(filename, checksum):
+                with wheel_file(pool / filename, checksum) as stream:
                     data = wheel_metadata(stream)
             else:
                 hint = item["metadata"]
@@ -616,7 +912,7 @@ def lock_project(project, pool, output):
                             continue
 
                         try:
-                            if not cached(filename, checksum):
+                            if (item.get("path") is None) and not cached(filename, checksum):
                                 continue
                         except Exception as error:
                             raise RuntimeError(f"Local wheel {filename=!s} from {item['index']=!s}: {error=!s}") from error
@@ -722,6 +1018,11 @@ def lock_project(project, pool, output):
         if process.returncode:
             resolver_error = process.stderr.strip()
 
+            if offline:
+                local_wheels = [str(source.path) for source in sources.values() if source.path is not None]
+
+                raise RuntimeError(f"uv could not resolve dependencies using {local_wheels=!s} and {pool=!s}:\n" f"{resolver_error=!s}")
+
             raise RuntimeError(f"uv could not resolve dependencies:\n" f"{resolver_error=!s}")
 
         document = Pylock.from_dict(tomllib.loads(raw.read_text()))
@@ -729,7 +1030,8 @@ def lock_project(project, pool, output):
 
         for package in document.packages:
             name = package.name
-            index = sources.get(name, sources["default"]).url
+            source = sources.get(name, sources["default"])
+            index = None if offline or (source.path is not None) else source.url
             identity = (index, name, package.version)
             digests = observed.get(identity, set())
 
@@ -760,7 +1062,7 @@ def lock_project(project, pool, output):
                 if (wheel.hashes.get("sha256") != checksum) or (checksum is None):
                     raise ValueError(f"uv artifact hash disagrees with publisher for {item['name']=!s}")
 
-                wheels.append(replace(wheel, url=item["url"], name=item["name"], upload_time=None))
+                wheels.append(replace(wheel, url=item["url"], path=str(item["path"]) if item.get("path") is not None else None, name=item["name"], upload_time=None))
 
                 # uv may use one wheel's metadata for a version. Every retained wheel
                 # must match those exact bytes before acquisition or offline use.
@@ -789,21 +1091,51 @@ def main(argv=None):
     for action in ("lock", "acquire", "check"):
         command = subcommands.add_parser(action)
 
-        command.add_argument("--lock", type=Path, required=True)  # Write the authoritative lock for lock; read it for acquire/check.
+        command.add_argument("--lock", type=Path, required=(action != "acquire"))  # Write the authoritative lock for lock; read it for acquire/check.
         command.add_argument("--pool", type=Path, required=True)  # Use this shared wheel directory for preference, acquisition and verification.
 
         if action == "lock":
+            command.add_argument("--offline", action="store_true")
             command.add_argument("--project", type=Path, required=True)  # Resolve the dependencies and sources declared by this pyproject.toml.
         else:
-            command.add_argument("--local-lock", type=Path)  # Optionally write a disposable pylock projection with verified local wheel paths.
+            if action == "acquire":
+                command.add_argument("--project", type=Path)
+                command.add_argument("--package")
+
+            projections = command.add_mutually_exclusive_group()
+
+            projections.add_argument("--local-lock", type=Path)  # Optionally write a disposable pylock projection with verified local wheel paths.
+
+            if action == "check":
+                projections.add_argument("--requirements", type=Path)  # Write hashed local wheel references for offline pip/uv installation.
+                command.add_argument("--destination-map", type=Path)  # Map the complete selection to absolute installation paths.
+
 
     arguments = parser.parse_args(argv)
 
+    if arguments.action == "acquire":
+        prepare = (arguments.project is not None) or (arguments.package is not None)
+
+        if prepare and ((arguments.project is None) or (arguments.package is None) or (arguments.lock is not None) or (arguments.local_lock is not None)):
+            parser.error("Use acquire --project PROJECT --package NAME, or acquire --lock LOCK")
+
+        if (not prepare) and (arguments.lock is None):
+            parser.error("acquire requires --lock or --project and --package")
+
     try:
-        if arguments.action == "lock":
-            result = lock_project(arguments.project, arguments.pool, arguments.lock)
+        if (arguments.action == "acquire") and (arguments.project is not None):
+            result = prepare_package(arguments.project, arguments.package, arguments.pool)
+        elif arguments.action == "lock":
+            result = lock_project(arguments.project, arguments.pool, arguments.lock, arguments.offline)
         else:
-            result = consume(arguments.action, arguments.lock, arguments.pool, arguments.local_lock)
+            result = consume(
+                arguments.action,
+                arguments.lock,
+                arguments.pool,
+                arguments.local_lock,
+                getattr(arguments, "requirements", None),
+                getattr(arguments, "destination_map", None),
+            )
     except Exception as error:
         print(f"wheelhouse: {error=!s}", file=sys.stderr)
 

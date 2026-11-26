@@ -73,4 +73,6 @@ D2 resolved those structural gaps. Remaining findings named ANTLR's producer, el
 
 Work is supervised in bounded patches with independent audits and local commits. Update this ledger with integrated slices, tests and remaining consumer obligations. No completed slice alone establishes the cross-repository migration.
 
-- Design note written; implementation pending.
+- Core implementation integrated: exclusive exact remote/local declarations, shared exact preparation, offline resolution, complete artifact records, and mapped hashed installation requirements. Independent audits corrected filename admission and output/source aliases. Real SDK and ANTLR preparation exposed vendored setuptools metadata; metadata selection now admits the single root record. The 35 unit tests pass; online acquisition/reuse and offline installation also passed before that focused metadata correction.
+- SDK acquisition owner now contains the shared context exporter (local commit `82f5822e`). Twelve offline container tests cover selected bytes, path admission, bounded reads, mutation, cancellation, short writes and broken pipes. Audits corrected tar finalization after failure. This slice does not restore SDK release callers by itself.
+- SDK acquisition/release/delivery and consumer preparation remain in progress. No new tool release or consumer deployment is claimed.
