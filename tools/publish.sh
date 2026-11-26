@@ -5,7 +5,8 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 docker_host=$1
-[[ -z $(git status --porcelain) ]] || fail 'Commit pending changes before publishing.'
+checkout_status=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+[[ -z $checkout_status ]] || fail 'Commit pending changes before publishing.'
 command -v gh >/dev/null || fail 'Install and authenticate the GitHub CLI before publishing.'
 commit=$(git rev-parse HEAD)
 repository=numpde/wheelhouse

@@ -337,7 +337,9 @@ Maintainers publish the bundle and checksum as assets of a versioned GitHub
 release. Work from a clean checkout with Git, Make, Bash, a local Docker engine,
 and an authenticated GitHub CLI (`gh`) with release access to this repository.
 Write the release notes as `notes/NNN_release_vX.Y.Z.md`, keeping each paragraph
-or list item on one source line. Commit the source and notes, then run:
+or list item on one source line. The lane refuses staged changes, unstaged changes
+and untracked files, even when Git configuration hides them. Ignored build outputs
+may remain. Commit the source and notes, then run:
 
 ```sh
 make publish/release DOCKER_CONTEXT="$context"
