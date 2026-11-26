@@ -1,0 +1,5 @@
+[project]
+dependencies = ["requests==2.32.3", "numpy==2.2.2"]
+
+[tool.wheelhouse]
+index = "https://pypi.org/simple"

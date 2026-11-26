@@ -3,7 +3,7 @@ name: Wheelhouse proof
 on:
   push:
     branches: [main]
-    paths: [wheelhouse.py, Dockerfile, Makefile, .github/workflows/proof.yml]
+    paths: [wheelhouse.py, Dockerfile, Makefile, proof.toml, .github/workflows/proof.yml]
   workflow_dispatch:
 
 permissions:

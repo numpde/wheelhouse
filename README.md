@@ -25,20 +25,16 @@ cd /home/ra/repos/wheelhouse &&
 make proof ENGINE_CONTEXT=science
 ```
 
-The [Makefile](Makefile) contains the proof commands directly. It explicitly
-builds `wheelhouse:proof`, resolves and acquires Requests and NumPy from PyPI,
-then widens their requirements and checks that the existing selection is
-retained with zero further wheel downloads. A fresh container checks and
-installs the closure with networking disabled and inputs mounted read-only.
-It also checks failures for missing wheels and missing or conflicting metadata
-evidence. All Python and packaging tools run inside containers.
+The [Makefile](Makefile) runs four targets in order: `image`, `lock`, `acquire`,
+`offline`. Dependencies and publisher are declared in [proof.toml](proof.toml).
+All Python and packaging tools run in the prepared `wheelhouse:proof` image.
 
-Trial files and downloads live at `/trial` inside a temporary Docker volume
-named `wheelhouse-proof-...`. The volume is removed afterward; the prepared
-tools image remains. The proof does not need the operator's existing wheel
-folder. [GitHub Actions](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
-runs this same Make target. `make image ENGINE_CONTEXT=science` prepares only
-the tools image.
+The host keeps `.proof/project/wheelhouse.lock` and `.proof/wheels/` between
+runs. Lock creation mounts the wheels read-only. The fresh offline container
+mounts both inputs read-only and disables networking: it repeats acquisition
+to demonstrate reuse, verifies the wheels, installs them, and checks the
+installed dependencies. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
+runs the same Make target.
 
 ## Use an existing shared wheel folder
 
@@ -134,8 +130,7 @@ marker values are recorded only when consulted by dependency markers. Other
 machines must match that target and have compatible wheel tags; this is not
 a cross-platform resolution. No persistent resolver cache is required.
 
-The Makefile proof covers the real Requests/NumPy flow and the basic failures
-above. It does not run the former synthetic fixtures for backtracking,
-publisher routing, or redirects. Real Torch/CUDA acquisition and an operator's
-existing wheel folder remain separate trials. Publishers without the required
-sidecars can be used only when the needed exact wheel is already in the pool.
+The proof covers Requests/NumPy acquisition, reuse and offline installation.
+Resolver edge cases, failure scenarios, real Torch/CUDA acquisition and the
+operator's existing wheel folder remain separate trials. Publishers without
+the required sidecars need the exact wheel to be already present in the pool.
