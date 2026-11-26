@@ -49,7 +49,8 @@ class Commands(unittest.TestCase):
     def tool(self, action, *, error=None, **options):
         arguments = [
             sys.executable,  # Use the proof image's Python interpreter.
-            "/opt/wheelhouse/wheelhouse.py",  # Exercise the implementation baked into the image.
+            "-S",  # Prove the bundle supplies its own Python dependencies.
+            "/bundle/wheelhouse.pyz",  # Exercise the exact distributable artifact.
             action,  # Select lock creation, acquisition, or offline verification.
         ]
 

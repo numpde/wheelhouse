@@ -4,6 +4,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN uv --no-config --no-cache pip install --system --no-python-downloads \
     --only-binary=:all: --require-hashes -r /tmp/requirements.txt
 ENV PYTHONPATH=/opt/wheelhouse PYTHONDONTWRITEBYTECODE=1
-COPY wheelhouse.py /opt/wheelhouse/wheelhouse.py
+COPY wheelhouse.py requirements.txt /opt/wheelhouse/
+COPY tools/build_bundle.py /opt/wheelhouse/build_bundle.py
 WORKDIR /work
 ENTRYPOINT ["python", "/opt/wheelhouse/wheelhouse.py"]
