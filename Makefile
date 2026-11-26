@@ -10,6 +10,7 @@ RUN := $(DOCKER) run --rm --pull never \
 .PHONY: test proof image
 
 test: image
+	$(RUN) --network none $(IMAGE) -m unittest -v test_artifacts
 	@set -eu; \
 	volume=$$($(DOCKER) volume create); \
 	trap '$(DOCKER) volume rm "$$volume" >/dev/null' 0; \

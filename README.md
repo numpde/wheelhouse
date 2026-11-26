@@ -1,9 +1,11 @@
 # Wheelhouse
 
-A small implementation of [the desiderata](notes/000_desiderata.txt).
-uv resolves dependencies; the released wheelhouse SDK selects locked artifacts,
-checks their hashes, downloads them, and projects locks for offline installation.
-This adapter supplies the local preference and mandatory metadata checks.
+A small standalone implementation of [the desiderata](notes/000_desiderata.txt).
+uv resolves dependencies and installs packages; `packaging` validates locks and
+selects compatible wheels. This repo implements the local preference, shared
+pool, acquisition and mandatory metadata checks. Its two Python dependencies
+(`packaging` and the TOML writer `tomli-w`) are hash-pinned in
+[requirements.txt](requirements.txt) and installed inside the tools image.
 
 | Operation | Project | Shared wheel folder | Network |
 | --- | --- | --- | --- |
@@ -25,15 +27,17 @@ cd /home/ra/repos/wheelhouse &&
 make test ENGINE_CONTEXT=science
 ```
 
-The checked-in [unittest](tests/test_wheelhouse.py) uses a static
+The [artifact tests](tests/test_artifacts.py) run without networking and check
+verified publication, reuse, and rejection of corrupted files and metadata.
+The [integration test](tests/test_wheelhouse.py) uses a static
 [project fixture](tests/fixtures/pyproject.toml). Its online phase resolves,
 acquires and checks reuse. A fresh container then verifies and installs the
 same artifacts with networking disabled and its inputs mounted read-only.
 
-The [Makefile](Makefile) prepares `wheelhouse:proof` and runs both phases.
+The [Makefile](Makefile) prepares `wheelhouse:proof` and runs the tests.
 Generated locks and wheels live in a temporary Docker volume mounted at
 `/trial`; Make removes it on success or failure. Temporary installation files
-are cleaned by the test and both containers are removed automatically.
+are cleaned by the tests and all test containers are removed automatically.
 All Python runs inside Docker. [CI](https://github.com/numpde/wheelhouse/actions/workflows/proof.yml)
 runs the same target; `make proof` remains an alias.
 

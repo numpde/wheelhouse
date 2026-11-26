@@ -1,25 +1,46 @@
 """Strict metadata-only locking and verified consumption of a shared wheel pool."""
 
 import argparse
+import fcntl
+import hashlib
 import html
+import http.client
+import io
 import ipaddress
+import json
+import os
 import platform
+import re
+import socket
+import stat
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import threading
+import time
+import token
+import tokenize
 import tomllib
 import urllib.error
 import urllib.request
+import zipfile
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import lru_cache
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
+import tomli_w
+from packaging.markers import default_environment
+from packaging.metadata import Metadata, parse_email
+from packaging.pylock import Pylock, is_valid_pylock_path
 from packaging.requirements import Requirement
 from packaging.specifiers import SpecifierSet
 from packaging.tags import sys_tags
-from packaging.utils import InvalidWheelFilename
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 from packaging.version import Version
 
 
@@ -56,11 +77,7 @@ def network_policy(allow_test_http=False, metadata_only=False):
 
     class HTTPSRedirects(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, stream, code, message, headers, new_url):
-            try:
-                permitted(new_url, previous=request.full_url)
-            except ValueError as error:
-                # Keep the reason visible through the released SDK's error handling.
-                raise RuntimeError(str(error)) from error
+            permitted(new_url, previous=request.full_url)
             return super().redirect_request(request, stream, code, message, headers, new_url)
 
     previous = urllib.request._opener
@@ -88,27 +105,6 @@ def atomic_write(path, content):
                 os.close(directory)
         finally:
             temporary.unlink(missing_ok=True)
-
-
-import hashlib
-import io
-import json
-import os
-import re
-import stat
-import sysconfig
-import tempfile
-import token
-import tokenize
-import zipfile
-from pathlib import Path
-
-from packaging.markers import default_environment
-from packaging.metadata import Metadata, parse_email
-from packaging.pylock import Pylock
-from packaging.utils import canonicalize_name, parse_wheel_filename
-from wheelhouse_tool import __main__ as sdk
-from wheelhouse_tool.validation.upstream.pylock import require_pylock_filename
 
 
 def target_environment(extra=()):
@@ -185,6 +181,98 @@ def _sha256_text(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+@contextmanager
+def pool_lock(pool):
+    descriptor = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def acquisition_lock(pool):
+    # Keep this lock file in place so concurrent writers share one lock inode.
+    with pool_lock(pool) as directory_fd:
+        descriptor = os.open(".wheelhouse-acquire.lock",
+                             os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o644, dir_fd=directory_fd)
+        with os.fdopen(descriptor, "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError(".wheelhouse-acquire.lock must be a regular file")
+            fcntl.flock(stream, fcntl.LOCK_EX)
+            yield directory_fd
+
+
+def inspect_artifact(pool, name, digest, directory_fd=None):
+    try:
+        descriptor = os.open(name if directory_fd is not None else pool / name,
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return False
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError(f"{name}: expected a regular wheel file")
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual != digest:
+        raise ValueError(f"{name}: SHA-256 {actual} differs from locked {digest}; existing file retained")
+    return True
+
+
+def _download_once(path, digest, url):
+    stream = path.open("xb")
+    try:
+        with stream, urllib.request.urlopen(url, timeout=60) as source:
+            checksum, received = hashlib.sha256(), 0
+            while block := source.read(1024 * 1024):
+                received += len(block)
+                checksum.update(block)
+                stream.write(block)
+            length = source.headers.get("Content-Length")
+            if length is not None and length.isdecimal():
+                expected = int(length)
+                if received < expected:
+                    raise http.client.IncompleteRead(b"", expected - received)
+                if received > expected:
+                    raise ValueError(f"Download exceeded declared length: received {received} bytes, expected {expected}")
+            actual = checksum.hexdigest()
+            if actual != digest:
+                raise ValueError(f"SHA-256 {actual} differs from locked {digest}")
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.fsync(stream.fileno())
+    except BaseException:
+        path.unlink()
+        raise
+
+
+def download(path, digest, url):
+    """Stream into private staging; retry only transient transport failures."""
+    for attempt in range(3):
+        try:
+            _download_once(path, digest, url)
+            return
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            reason = error.reason if isinstance(error, urllib.error.URLError) else error
+            retryable = isinstance(reason, (TimeoutError, ConnectionError, http.client.HTTPException))
+            retryable |= isinstance(reason, socket.gaierror) and reason.errno == socket.EAI_AGAIN
+            if isinstance(error, urllib.error.HTTPError):
+                retryable = error.code in {408, 429, 500, 502, 503, 504}
+                error.close()
+            if not retryable or attempt == 2:
+                raise ValueError(f"{path.name} from {url}: download failed: {error}") from error
+            time.sleep(attempt + 1)
+
+
+def local_lock(document, pool, artifacts):
+    packages = [
+        replace(package, wheels=[replace(wheel, url=None, path=str(pool / name))])
+        for name, _digest, _url, package, wheel in artifacts
+    ]
+    return tomli_w.dumps(replace(document, packages=packages).to_dict())
+
+
 def load_locked(lock, allow_test_http=False):
     """Validate mandatory evidence for every permitted wheel before selection."""
     lock = Path(lock)
@@ -226,7 +314,13 @@ def load_locked(lock, allow_test_http=False):
             covered.add(digest)
     if set(evidence) != covered:
         raise ValueError("Metadata evidence contains entries not identified by a locked wheel")
-    artifacts = sdk.selected(lock, (), document=document)
+    artifacts, filenames = [], {}
+    for package, wheel in document.select():
+        name, digest = wheel.filename, wheel.hashes["sha256"]
+        if name in filenames and filenames[name] != digest:
+            raise ValueError(f"{name}: the lock selects conflicting bytes for one filename")
+        filenames[name] = digest
+        artifacts.append((name, digest, wheel.url, package, wheel))
     return envelope, document, artifacts
 
 
@@ -247,7 +341,7 @@ def _check_cached(pool, artifacts, envelope, directory_fd):
     for artifact in artifacts:
         name, digest, url, _package, _wheel = artifact
         try:
-            if not sdk.inspect_artifact(pool, name, digest, directory_fd):
+            if not inspect_artifact(pool, name, digest, directory_fd):
                 missing.append(artifact)
                 continue
             _check_metadata(pool, artifact, envelope, directory_fd)
@@ -263,28 +357,29 @@ def consume(action, lock, pool, local_output=None, allow_test_http=False):
     lock, pool = Path(lock), Path(pool)
     if local_output is not None:
         local_output = Path(local_output)
-        require_pylock_filename(local_output.name)
+        if not is_valid_pylock_path(local_output):
+            raise ValueError("The local projection must be named pylock.toml or pylock.<name>.toml")
         if local_output.resolve() == lock.resolve():
             raise ValueError("A disposable local projection must not replace the authoritative lock")
         if pool.resolve() in local_output.resolve().parents:
             raise ValueError("Write the disposable local projection outside the shared wheel pool")
     envelope, document, artifacts = load_locked(lock, allow_test_http)
     downloaded = []
-    with sdk.pool_lock(pool, exclusive=False) as directory_fd:
+    with pool_lock(pool) as directory_fd:
         missing = _check_cached(pool, artifacts, envelope, directory_fd)
     if missing and action == "check":
         raise FileNotFoundError(f"Missing locked wheels: {', '.join(artifact[0] for artifact in missing)}")
     if missing:
-        with sdk.acquisition_lock(pool) as directory_fd:
+        with acquisition_lock(pool) as directory_fd:
             # Another cooperating writer may have completed while we waited.
             missing = _check_cached(pool, artifacts, envelope, directory_fd)
             if missing:
                 with tempfile.TemporaryDirectory(prefix=".wheelhouse-verify-", dir=pool) as temporary:
                     staging = Path(temporary)
-                    with sdk.pool_lock(staging, exclusive=False) as staging_fd, network_policy(allow_test_http):
+                    with pool_lock(staging) as staging_fd, network_policy(allow_test_http):
                         for artifact in missing:
                             name, digest, url, _package, _wheel = artifact
-                            sdk.download(staging, name, digest, url, staging_fd)
+                            download(staging / name, digest, url)
                             _check_metadata(staging, artifact, envelope, staging_fd)
                             try:
                                 os.link(name, name, src_dir_fd=staging_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
@@ -295,7 +390,7 @@ def consume(action, lock, pool, local_output=None, allow_test_http=False):
                             downloaded.append(name)
                             os.unlink(name, dir_fd=staging_fd)
     if local_output is not None:
-        projection = sdk.local_lock(lock, pool.resolve(), document=document, artifacts=artifacts)
+        projection = local_lock(document, pool.resolve(), artifacts)
         atomic_write(local_output, projection.encode("utf-8"))
     return {"artifacts": [artifact[0] for artifact in artifacts], "downloaded": downloaded}
 
@@ -362,7 +457,7 @@ def lock_project(project, pool, output, allow_test_http=False):
 
     @lru_cache(maxsize=None)
     def cached(name, checksum):
-        return name in initial and checksum is not None and sdk.inspect_artifact(pool, name, checksum)
+        return name in initial and checksum is not None and inspect_artifact(pool, name, checksum)
 
     @lru_cache(maxsize=None)
     def page(package):
