@@ -136,6 +136,49 @@ URLs are unsupported. Publishers must supply separate dependency metadata when
 a verified wheel is unavailable locally. Missing required metadata fails lock
 creation without downloading wheel bytes or replacing the existing lock.
 
+### Use a prepared wheel or a private candidate
+
+The following capabilities are available in the source build. The pinned
+v0.1.1 release above predates them.
+
+Bind a package to one wheel by declaring `wheel` (an HTTPS URL) and `sha256`,
+or `path` (a local wheel file) and `sha256`. These bindings are exclusive:
+Wheelhouse never substitutes a same-version wheel from another source.
+Local paths are relative to the project file and must be visible inside the
+target container. Keep candidate wheels in a private directory outside the pool.
+
+For example, after building a candidate SDK wheel, declare its actual checksum:
+
+```toml
+[tool.wheelhouse.sources.provider-core]
+path = "candidates/provider_core-0.7.8-py3-none-any.whl"
+sha256 = "REPLACE_WITH_THE_CANDIDATE_SHA256"
+```
+
+Replace the placeholder with the wheel's 64-character lowercase SHA-256.
+A lock made from this declaration contains an absolute local path; it is a
+temporary candidate lock, not a portable release lock. A missing or changed
+candidate fails even if the pool contains a released wheel with the same name.
+
+An exact remote wheel can be prepared before locking, even when its publisher
+does not provide a metadata sidecar. In the target container, with the project,
+bundle and writable pool mounted as above, run:
+
+```sh
+python -S /tool.pyz acquire --project /project/pyproject.toml \
+  --package provider-core --pool /wheels
+```
+
+Preparation reads the same declaration used by `lock`, verifies the wheel's
+checksum and embedded metadata, and downloads no dependencies. Locking then
+uses that verified metadata. Local preparation verifies the candidate in place.
+Index and page declarations require ordinary resolution instead.
+
+To resolve entirely from local wheels, add `--offline` to `lock` and disable the
+container's network. Explicit bindings must then be local; packages without a
+binding use compatible wheels in the chosen pool. The resulting lock records
+local paths. Offline resolution never falls back to a publisher.
+
 ## Create the lock and acquire wheels
 
 Continue in the same shell used to prepare the tool. Set your existing project
@@ -165,9 +208,10 @@ docker --context "$context" run --rm --pull never \
   --lock /project/wheelhouse.lock
 ```
 
-Commit `wheelhouse.lock` with the project. Lock creation contacts publisher
-indexes even when the pool already contains all needed wheels. Run it again
-when you intend to reconsider the dependency selection.
+Commit a remote-origin `wheelhouse.lock` with the project. Keep candidate and
+offline locks temporary because they contain local paths. Ordinary index
+resolution contacts publishers even when the pool contains all needed wheels.
+Run it again when you intend to reconsider the dependency selection.
 
 Acquire the exact locked files, preserving that selection:
 
@@ -216,17 +260,47 @@ installed environment in the resulting image. Additional targets need qualificat
 the current proof exercises Linux CPython 3.13.
 
 The temporary `pylock.toml` contains local paths. Do not commit or distribute it;
-share the authoritative `wheelhouse.lock` instead.
+share the remote-origin `wheelhouse.lock` instead. Candidate and offline locks
+also contain local paths and must be regenerated where those inputs are available.
+
+### Install with pip or supply container destinations
+
+The source build can also produce hashed requirements from the complete checked
+selection. In a prepared target container, use:
+
+```sh
+python -S /tool.pyz check --lock /project/wheelhouse.lock \
+  --pool /wheels --requirements /tmp/install.txt
+python -m pip install --no-index --no-deps --require-hashes -r /tmp/install.txt
+```
+
+The output uses escaped `file:` URLs and SHA-256 hashes, supported by pip and uv.
+Keep the container offline. The installer verifies the bytes again when it uses
+them. Failed verification leaves any existing output unchanged.
+
+Each successful check also returns `artifact_entries`: the selected package,
+version, filename, SHA-256 and absolute `source_path`. A build-context producer
+can use these entries to transfer just the selected wheels, including private
+candidates outside the pool.
+
+When installation paths differ from source paths, pass
+`--destination-map /project/destinations.json` together with `--requirements`.
+The map contains an `artifacts` array with one entry per selected wheel:
+`source_path`, `sha256`, and absolute `destination`. Copy source identities and
+hashes from the check result, retain each wheel's filename, and cover the full
+selection. Incomplete, extra, conflicting or duplicate mappings fail.
+Wheelhouse renders installation paths; the consumer owns file transfer and
+must verify that its exporter and image builder both finish successfully.
 
 ## Reuse the pool or prepare another machine
 
 For a second project, use the same pool path and that project's own
 `pyproject.toml` and `wheelhouse.lock`. Run `lock` and `acquire` again; compatible
-cached wheels are preferred and reused. Locking still contacts publishers.
+cached wheels are preferred and reused. Ordinary index resolution still contacts publishers.
 After changing dependencies, regenerate the lock, review and commit it, then
 acquire any newly selected wheels.
 
-Keep the shared wheel pool and commit each project's authoritative
+Keep the shared wheel pool and commit each project's remote-origin
 `wheelhouse.lock`. Regenerate the temporary `pylock.toml` wherever you install,
 because it contains local paths. Do not commit or transfer that temporary file.
 
