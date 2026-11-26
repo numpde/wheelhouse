@@ -1,14 +1,26 @@
 Wheelhouse desiderata
 =====================
 
-Goal: reuse what is already available, acquire only what is missing, and
-build reproducibly offline, with minimal custom code.
+Goal: reuse what is already available, resolve from metadata, acquire only
+what is missing, and build reproducibly offline, with minimal custom code.
 
-1. Local-first resolution
+1. Local-first, metadata-only resolution
    When creating a lock, prefer eligible wheels in the existing shared
-   wheelhouse. If they suffice, do not download their contents again,
-   even in a new repository with an empty tool cache. Requests for
-   publisher metadata are permissible and distinct from wheel downloads.
+   wheelhouse, even in a new repository with an empty tool cache.
+   Missing dependencies may be resolved to remote artifacts using their
+   metadata. Retain other eligible cached choices rather than replacing
+   them with newer remote versions solely because a dependency is missing.
+
+   Read dependency metadata from hash-verified local wheels or separately
+   published metadata for the exact candidate artifact. Publisher index
+   and metadata requests are permissible. Do not download remote wheel
+   contents, including byte ranges, or modify the shared wheelhouse.
+
+   If metadata needed by the resolver is unavailable or invalid, fail
+   clearly, identify the artifact and publisher, and preserve any existing
+   lock. Do not guess dependencies, silently treat missing metadata as
+   incompatibility, or switch publishers. This concerns candidates the
+   resolver needs to inspect, not every artifact listed by an index.
 
 2. Target compatibility
    Respect dependency constraints, package versions, Python versions,
@@ -17,25 +29,45 @@ build reproducibly offline, with minimal custom code.
    declared package sources.
 
 3. Acquisition of missing artifacts
-   When local wheels are insufficient, acquire the missing required
-   artifacts from their declared sources. Online fallback must continue
-   to reuse eligible cached wheels rather than replacing them with
-   newer remote versions solely because other dependencies are missing.
-   Verify artifact hashes and publish complete files atomically.
+   Consume the completed lock without resolving dependencies or changing
+   its selections. Reuse verified exact files from the shared wheelhouse
+   and acquire only missing locked artifacts from their declared sources.
+
+   Before accepting a wheel for use, verify its artifact hash and that
+   its embedded METADATA matches the metadata used during resolution.
+   Apply both checks to downloaded and already cached wheels. New files
+   must pass both checks before being published atomically. A mismatch
+   must fail clearly without rewriting the lock, choosing another wheel,
+   or replacing an existing pool file.
 
 4. One authoritative, portable lock
    Record the resolved dependencies and their selected artifact
    identities, including hashes and genuine acquisition URLs. The lock
-   must be sufficient to acquire the same artifacts on another machine.
-   Do not embed host-specific paths or maintain competing dependency
-   records. Do not infer publisher URLs from wheel filenames.
+   must be sufficient to acquire the same artifacts on another machine
+   with the same target. Portability does not imply that other targets
+   have been resolved or checked.
+
+   Preserve in this same lock sufficient per-artifact evidence of the
+   exact metadata used during resolution, such as its content hash.
+   Evidence must cover every wheel the lock permits for installation;
+   a package name/version match alone is insufficient. Treat this
+   evidence as required for verification, not an optional annotation.
+   Verification must not depend on the original resolver cache, a
+   separate dependency record, or a later publisher metadata response.
+
+   Do not embed host-specific paths or infer publisher URLs from wheel
+   filenames.
 
 5. Offline builds
-   Build and install from the committed lock and local artifacts only.
+   Build and install from the committed lock and a read-only shared
+   wheelhouse, with networking disabled and without relying on a
+   populated installer cache. Check artifact hashes and metadata
+   consistency before installation. Fail clearly if a required file is
+   missing or incorrect, or if required metadata evidence is absent or
+   invalid.
    Do not resolve dependencies again, update the lock, download
-   artifacts, or pull images implicitly. Missing or incorrect files
-   must cause a clear failure. Lock updates and acquisition are
-   explicit operations.
+   artifacts, or pull images implicitly. Lock updates, acquisition,
+   and image preparation are explicit operations.
 
 6. Shared wheelhouse
    Reuse a single host-local wheelhouse across repositories and targets.
@@ -65,26 +97,66 @@ build reproducibly offline, with minimal custom code.
 Resolution versus lock consumption
 ---------------------------------
 
-When creating a lock, prefer eligible locally available artifacts.
+Lock creation decides which artifacts to use and writes the lock.
+It reads the shared wheelhouse without changing it and transfers only
+publisher index and metadata information.
 
-When consuming an existing lock, reuse the exact locked artifacts for
-the target. The presence of an alternative cached wheel does not
-authorize changing the dependency selection.
+Acquisition follows the existing lock and writes missing verified wheels
+to the shared wheelhouse. The presence of an alternative cached wheel
+does not authorize changing the dependency selection.
+
+Offline builds consume the lock and wheelhouse without changing either.
+These are separate responsibilities; they do not require separate
+permanent containers.
+
+
+Trust and metadata consistency
+------------------------------
+
+At lock creation, trust the declared publishers and indexes for package
+listings, artifact identities, and separately published metadata. Trust
+package maintainers for their code and dependency declarations, project
+maintainers for source choices and the committed lock, and the tooling
+and host for enforcing these requirements.
+
+Checking a metadata hash and a wheel hash separately does not establish
+that the metadata describes that wheel. Compare the wheel's embedded
+METADATA with the evidence retained from resolution. This establishes
+agreement between the two; it does not establish that the code is safe.
 
 
 Demonstration criteria
 ----------------------
 
 - Complete compatible wheelhouse, empty tool cache:
-  zero wheel downloads during lock creation and acquisition.
+  zero wheel downloads during lock creation and acquisition; the pool
+  remains unchanged during lock creation.
 
-- One required artifact missing:
-  download only that artifact; retain the other eligible cached wheels,
-  even if newer eligible versions are available remotely.
+- One required artifact missing, with its metadata available:
+  zero wheel downloads during lock creation; acquisition downloads only
+  that artifact. Retain the other eligible cached wheels, even if newer
+  eligible versions are available remotely.
+
+- Required metadata unavailable or invalid, with the wheel absent locally:
+  lock creation fails clearly without fetching wheel contents or changing
+  the existing lock or shared wheelhouse.
 
 - Mixed Python versions, ABIs, platforms, or CPU/CUDA variants:
-  select compatible artifacts; if only incompatible wheels are cached,
-  acquire the correct missing wheel.
+  select compatible artifacts from declared sources. If only incompatible
+  wheels are cached, resolve using metadata and acquire the correct missing
+  wheel in the acquisition operation.
+
+- Downloaded wheel matches its locked artifact hash, but its embedded
+  metadata disagrees with the metadata used during resolution:
+  acquisition fails before publishing it, without rewriting the lock.
+
+- The same metadata disagreement in an already cached wheel:
+  acquisition and offline checks fail while preserving the file and lock.
+  Missing required metadata evidence also causes a clear failure.
+
+- Committed lock and wheel files on a fresh machine with the same target:
+  verify artifact hashes and metadata consistency without the originating
+  resolver cache or access to publisher metadata.
 
 - Prepared lock and wheelhouse:
   install successfully in a fresh container with networking disabled,
