@@ -57,14 +57,14 @@ licenses, and metadata; it does not include Python or uv. No host Python is
 needed for these Docker examples.
 
 With `curl` and `sha256sum` on the host, download the bundle from the pinned
-[v0.2.0 release](https://github.com/numpde/wheelhouse/releases/tag/v0.2.0) and
+[v0.2.1 release](https://github.com/numpde/wheelhouse/releases/tag/v0.2.1) and
 verify it against the recorded checksum below. Use a dedicated folder; these
 commands replace `wheelhouse.pyz` there:
 
 ```sh
-version=v0.2.0
+version=v0.2.1
 release="https://github.com/numpde/wheelhouse/releases/download/$version"
-expected_sha256=b9730fd1dd9668e98f55a952e64328f193b5d2ca6d203fc1c150332fc672e90a
+expected_sha256=205c9341a5fa45969493256cf7e23cd41753ce8b297b99a5e2df406c4d06371e
 mkdir -p vendor/wheelhouse
 curl --fail --location "$release/wheelhouse.pyz" \
   --output vendor/wheelhouse/wheelhouse.pyz
@@ -139,7 +139,7 @@ creation without downloading wheel bytes or replacing the existing lock.
 
 ### Use a prepared wheel or a private candidate
 
-The following capabilities are included in the pinned v0.2.0 release.
+The following capabilities are included in the pinned v0.2.1 release.
 
 Bind a package to one wheel by declaring `wheel` (an HTTPS URL) and `sha256`,
 or `path` (a local wheel file) and `sha256`. These bindings are exclusive:

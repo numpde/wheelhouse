@@ -5,6 +5,8 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -118,6 +120,34 @@ class PackagePages(unittest.TestCase):
 
         self.assertEqual(b"previous lock", self.lock.read_bytes())
         self.assertFalse(list(self.pool.glob("*.whl")))
+
+    def test_wide_dependency_graph_locks_without_downloading_wheels(self):
+        names = [("dependency" + str(number)) for number in range(96)]
+        dependencies = "".join(("Requires-Dist: " + name + "==1.0\n") for name in names)
+        thread_counts = []
+
+        self.add_wheel("fixture", self.page, dependencies.encode())
+
+        for name in names:
+            self.add_wheel(name, "https://publisher.example/simple/" + name + "/")
+
+        def fetch(request, **options):
+            # Publisher latency keeps uv's speculative metadata requests in flight.
+            thread_counts.append(threading.active_count())
+
+            time.sleep(0.01)
+
+            return self.fetch(request, **options)
+
+        with patch("wheelhouse.urllib.request.urlopen", side_effect=fetch):
+            wheelhouse.lock_project(self.project, self.pool, self.lock)
+
+        packages = json.loads(self.lock.read_text())["resolution"]["packages"]
+
+        self.assertEqual({"fixture", *names}, {item["name"] for item in packages})
+        self.assertFalse(any(url.endswith(".whl") for url in self.requests))
+        self.assertFalse(list(self.pool.iterdir()))
+        self.assertLessEqual(max(thread_counts), 8)
 
     def test_missing_page_does_not_fall_back_to_default_index(self):
         default_page = "https://publisher.example/simple/fixture/"

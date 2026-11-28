@@ -40,7 +40,7 @@ repo_checks() {
 }
 
 unit_tests() {
-    "${run[@]}" --network none "$image" -S -B -m unittest discover -s unit -t . -v
+    "${run[@]}" --network none --pids-limit 64 "$image" -S -B -m unittest discover -s unit -t . -v
 }
 
 integration_tests() (

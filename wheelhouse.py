@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from html.parser import HTMLParser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 
@@ -689,7 +689,6 @@ def lock_project(project, pool, output, offline=False):
     initial = {path.name for path in pool.iterdir()}
     tags = set(sys_tags())
     (artifacts, observed, failures) = ({}, {}, [])
-    gate = threading.RLock()
 
     @lru_cache(maxsize=None)
     def cached(name, checksum):
@@ -870,9 +869,7 @@ def lock_project(project, pool, output, offline=False):
 
         def serve(self, body):
             try:
-                # Serialize access to the snapshot and evidence, not uv's solving.
-                with gate:
-                    (data, content_type) = self.route(body)
+                (data, content_type) = self.route(body)
 
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -884,8 +881,7 @@ def lock_project(project, pool, output, offline=False):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # uv can abandon an in-flight prefetch.
             except Exception as error:
-                with gate:
-                    failures.append(error)
+                failures.append(error)
 
                 try:
                     self.send_error(502, "Wheelhouse metadata request failed")
@@ -960,8 +956,8 @@ def lock_project(project, pool, output, offline=False):
         sanitized.write_text("\n".join(requirements) + "\n")
         raw = work / "pylock.toml"
 
-        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-            server.daemon_threads = False
+        # Metadata was already serialized; serve it without one waiting thread per request.
+        with HTTPServer(("127.0.0.1", 0), Handler) as server:
             thread = threading.Thread(target=server.serve_forever, daemon=True)
 
             thread.start()
@@ -976,6 +972,11 @@ def lock_project(project, pool, output, offline=False):
             }
 
             environment["NO_PROXY"] = environment["no_proxy"] = "127.0.0.1,::1"
+
+            # Bound request fan-out and uv's native worker pool inside consumer PID caps.
+            environment["UV_CONCURRENT_DOWNLOADS"] = "4"
+
+            environment["UV_CONCURRENT_INSTALLS"] = "2"
 
             try:
                 process = subprocess.run(
